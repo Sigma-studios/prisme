@@ -151,7 +151,7 @@ impl Default for PngOptions {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExportResult {
     pub bytes: Vec<u8>,
     pub width: u32,

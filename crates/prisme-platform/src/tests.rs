@@ -23,6 +23,52 @@ fn spawn_and_poll() {
 }
 
 #[test]
+fn wait_future_chains_jobs() {
+    let a = spawn(|| {
+        std::thread::sleep(Duration::from_millis(20));
+        20
+    });
+    let b = spawn_async(async move { a.wait().await.map(|v| v + 1) });
+    assert_eq!(b.block(), Some(Some(21)));
+    // Abandoned producer -> None.
+    let (c, p) = pending_pair::<u8>();
+    drop(c);
+    assert_eq!(pollster::block_on(p.wait()), None);
+}
+
+#[test]
+fn spawn_job_progress_and_cancel() {
+    let task = spawn_job(|ctx| {
+        ctx.progress(0.25, "quarter");
+        let start = std::time::Instant::now();
+        while !ctx.cancelled() {
+            assert!(start.elapsed() < Duration::from_secs(5), "cancel not seen");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        "stopped"
+    });
+    let start = std::time::Instant::now();
+    while task.control.progress().is_none() {
+        assert!(start.elapsed() < Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(task.control.progress(), Some((0.25, "quarter".to_string())));
+    task.control.cancel();
+    assert!(task.control.is_cancelled());
+    assert_eq!(task.pending.block(), Some("stopped"));
+}
+
+#[test]
+fn buffers_convert() {
+    let f = vec![1.0f32, -2.5, 3.25];
+    let bytes = Buffer::F32(f.clone()).into_bytes();
+    assert_eq!(bytes.len(), 12);
+    assert_eq!(Buffer::Bytes(bytes).into_f32(), f);
+    let shared = std::sync::Arc::new(f.clone());
+    assert_eq!(Buffer::SharedF32(shared.clone()).into_f32(), f);
+}
+
+#[test]
 fn spawn_async_block_and_ready() {
     let p = spawn_async(async { "hello".to_string() });
     assert_eq!(p.block().as_deref(), Some("hello"));

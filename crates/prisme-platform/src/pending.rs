@@ -29,6 +29,18 @@ enum State<T> {
 struct Shared<T> {
     state: Mutex<State<T>>,
     cv: Condvar,
+    /// Task waiting in [`Pending::wait`].
+    waker: Mutex<Option<std::task::Waker>>,
+}
+
+impl<T> Shared<T> {
+    fn notify(&self) {
+        self.cv.notify_all();
+        if let Some(w) = lock(&self.waker).take() {
+            w.wake();
+        }
+        wake();
+    }
 }
 
 /// A pollable result of a background operation.
@@ -52,6 +64,7 @@ pub fn pending_pair<T>() -> (Completer<T>, Pending<T>) {
     let shared = Arc::new(Shared {
         state: Mutex::new(State::Waiting),
         cv: Condvar::new(),
+        waker: Mutex::new(None),
     });
     (
         Completer {
@@ -70,8 +83,7 @@ impl<T> Completer<T> {
     pub fn complete(mut self, value: T) {
         if let Some(shared) = self.shared.take() {
             *lock(&shared.state) = State::Ready(value);
-            shared.cv.notify_all();
-            wake();
+            shared.notify();
         }
     }
 }
@@ -84,8 +96,7 @@ impl<T> Drop for Completer<T> {
                 *st = State::Abandoned;
             }
             drop(st);
-            shared.cv.notify_all();
-            wake();
+            shared.notify();
         }
     }
 }
@@ -136,6 +147,36 @@ impl<T> Pending<T> {
     }
 }
 
+impl<T> Pending<T> {
+    /// A future resolving to the result (`None` if the producer was abandoned or the value was
+    /// already taken). Lets async code chain background jobs, on native and on the web.
+    pub fn wait(self) -> Wait<T> {
+        Wait { pending: self }
+    }
+}
+
+/// Future returned by [`Pending::wait`].
+pub struct Wait<T> {
+    pending: Pending<T>,
+}
+
+impl<T> Future for Wait<T> {
+    type Output = Option<T>;
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<T>> {
+        let shared = self.pending.shared.clone();
+        // Register before checking so a completion in between is not missed.
+        *lock(&shared.waker) = Some(cx.waker().clone());
+        if self.pending.is_done() {
+            lock(&shared.waker).take();
+            return std::task::Poll::Ready(self.pending.poll());
+        }
+        std::task::Poll::Pending
+    }
+}
+
 impl<T> std::fmt::Debug for Pending<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Pending")
@@ -156,7 +197,7 @@ pub fn set_wake_callback(f: impl Fn() + Send + Sync + 'static) {
     *WAKE.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(f));
 }
 
-fn wake() {
+pub(crate) fn wake() {
     let f = WAKE.read().unwrap_or_else(|e| e.into_inner()).clone();
     if let Some(f) = f {
         f();

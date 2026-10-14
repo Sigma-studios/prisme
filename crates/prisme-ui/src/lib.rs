@@ -8,6 +8,7 @@ pub mod commands;
 pub mod dialogs;
 pub mod doc;
 pub mod jobs;
+pub mod offload;
 pub mod outline;
 pub mod panels;
 pub mod rasterizer;

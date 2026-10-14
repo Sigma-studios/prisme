@@ -116,6 +116,35 @@ pub fn save_file(
     }
 }
 
+/// Like [`save_file`], but the bytes are produced in the background (e.g. by a
+/// [`crate::spawn_worker`] job). The dialog opens immediately, so on the web this still runs
+/// inside the user gesture, and the file is written once `bytes` resolves.
+pub fn save_file_deferred(
+    title: &str,
+    suggested_name: &str,
+    filters: &[FileFilter],
+    bytes: Pending<Result<Vec<u8>, String>>,
+) -> Pending<Result<Option<String>, String>> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let fut = dialog(title, filters)
+            .set_file_name(suggested_name)
+            .save_file();
+        spawn_async(async move {
+            let Some(h) = fut.await else { return Ok(None) };
+            let bytes = bytes.wait().await.unwrap_or_else(|| Err("encoding crashed".into()))?;
+            let path = h.path().to_path_buf();
+            write_file_path(&path, &bytes)?;
+            Ok(Some(path.display().to_string()))
+        })
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = title;
+        web_save::save_deferred(suggested_name, filters, bytes)
+    }
+}
+
 /// Write bytes to a path directly (native only). Writes to a temporary sibling file first
 /// and renames it into place, so a crash never leaves a truncated file.
 #[cfg(not(target_arch = "wasm32"))]
@@ -149,73 +178,107 @@ mod web_save {
     use super::FileFilter;
     use crate::pending::{Pending, pending_pair};
     use crate::web::*;
+    use std::future::Future;
     use wasm_bindgen::{JsCast, JsValue};
+
+    fn picker_options(suggested_name: &str, filters: &[FileFilter]) -> JsValue {
+        let opts = object();
+        set(&opts, "suggestedName", &JsValue::from_str(suggested_name));
+        let types = js_sys::Array::new();
+        for f in filters {
+            let accept = object();
+            // Group extensions per MIME type.
+            let mut by_mime: Vec<(&str, js_sys::Array)> = Vec::new();
+            for e in &f.extensions {
+                let m = mime_for_extension(e);
+                let ext = JsValue::from_str(&format!(".{}", e.trim_start_matches('.')));
+                if let Some((_, a)) = by_mime.iter().find(|(mm, _)| *mm == m) {
+                    a.push(&ext);
+                } else {
+                    let a = js_sys::Array::new();
+                    a.push(&ext);
+                    by_mime.push((m, a));
+                }
+            }
+            if by_mime.is_empty() {
+                continue;
+            }
+            for (m, a) in by_mime {
+                set(&accept, m, &a);
+            }
+            let t = object();
+            set(&t, "description", &JsValue::from_str(&f.name));
+            set(&t, "accept", &accept);
+            types.push(&t);
+        }
+        if types.length() > 0 {
+            set(&opts, "types", &types);
+        }
+        opts.into()
+    }
+
+    /// Open `showSaveFilePicker` synchronously (it needs the user activation). `None` when the
+    /// API is missing or refused.
+    fn open_picker(suggested_name: &str, filters: &[FileFilter]) -> Option<JsValue> {
+        let win = window()?;
+        get(&win, "showSaveFilePicker")?;
+        match call_method(&win, "showSaveFilePicker", &[picker_options(suggested_name, filters)]) {
+            Ok(promise) => Some(promise),
+            Err(e) => {
+                log::warn!("showSaveFilePicker failed ({}), falling back to download", err_string(&e));
+                None
+            }
+        }
+    }
 
     pub(super) fn save(
         suggested_name: &str,
         filters: &[FileFilter],
         bytes: Vec<u8>,
     ) -> Pending<Result<Option<String>, String>> {
-        let Some(win) = window() else {
+        if window().is_none() {
             return Pending::ready(Err("no window".into()));
-        };
-        if get(&win, "showSaveFilePicker").is_some() {
-            // Build options and call synchronously so the user activation is still valid.
-            let opts = object();
-            set(&opts, "suggestedName", &JsValue::from_str(suggested_name));
-            let types = js_sys::Array::new();
-            for f in filters {
-                let accept = object();
-                // Group extensions per MIME type.
-                let mut by_mime: Vec<(&str, js_sys::Array)> = Vec::new();
-                for e in &f.extensions {
-                    let m = mime_for_extension(e);
-                    let ext = JsValue::from_str(&format!(".{}", e.trim_start_matches('.')));
-                    if let Some((_, a)) = by_mime.iter().find(|(mm, _)| *mm == m) {
-                        a.push(&ext);
-                    } else {
-                        let a = js_sys::Array::new();
-                        a.push(&ext);
-                        by_mime.push((m, a));
-                    }
-                }
-                if by_mime.is_empty() {
-                    continue;
-                }
-                for (m, a) in by_mime {
-                    set(&accept, m, &a);
-                }
-                let t = object();
-                set(&t, "description", &JsValue::from_str(&f.name));
-                set(&t, "accept", &accept);
-                types.push(&t);
-            }
-            if types.length() > 0 {
-                set(&opts, "types", &types);
-            }
-            match call_method(&win, "showSaveFilePicker", &[opts.into()]) {
-                Ok(promise) => {
-                    let (c, p) = pending_pair();
-                    let name = suggested_name.to_string();
-                    wasm_bindgen_futures::spawn_local(async move {
-                        c.complete(write_via_handle(promise, bytes, name).await);
-                    });
-                    return p;
-                }
-                Err(e) => {
-                    log::warn!(
-                        "showSaveFilePicker failed ({}), falling back to download",
-                        err_string(&e)
-                    );
-                }
-            }
+        }
+        if let Some(promise) = open_picker(suggested_name, filters) {
+            let (c, p) = pending_pair();
+            let name = suggested_name.to_string();
+            wasm_bindgen_futures::spawn_local(async move {
+                c.complete(write_via_handle(promise, async move { Ok(bytes) }, name).await);
+            });
+            return p;
         }
         Pending::ready(download(suggested_name, &bytes).map(Some))
     }
 
+    /// Like [`save`], but the bytes are still being produced: the picker opens now (inside the
+    /// user gesture) and the file is written when `bytes` resolves.
+    pub(super) fn save_deferred(
+        suggested_name: &str,
+        filters: &[FileFilter],
+        bytes: Pending<Result<Vec<u8>, String>>,
+    ) -> Pending<Result<Option<String>, String>> {
+        let bytes = async move { bytes.wait().await.unwrap_or_else(|| Err("encoding crashed".into())) };
+        let (c, p) = pending_pair();
+        let name = suggested_name.to_string();
+        if let Some(promise) = open_picker(suggested_name, filters) {
+            wasm_bindgen_futures::spawn_local(async move {
+                c.complete(write_via_handle(promise, bytes, name).await);
+            });
+        } else {
+            wasm_bindgen_futures::spawn_local(async move {
+                let r = match bytes.await {
+                    Ok(b) => download(&name, &b).map(Some),
+                    Err(e) => Err(e),
+                };
+                c.complete(r);
+            });
+        }
+        p
+    }
+
     async fn write_via_handle(
         promise: JsValue,
-        bytes: Vec<u8>,
+        bytes: impl Future<Output = Result<Vec<u8>, String>>,
         fallback_name: String,
     ) -> Result<Option<String>, String> {
         let handle = match await_promise(promise).await {
@@ -226,6 +289,7 @@ mod web_save {
         let name = get(&handle, "name")
             .and_then(|n| n.as_string())
             .unwrap_or(fallback_name);
+        let bytes = bytes.await?;
         let inner = async {
             let writable = await_promise(call_method(&handle, "createWritable", &[])?).await?;
             let arr = js_sys::Uint8Array::from(bytes.as_slice());

@@ -290,12 +290,34 @@ pub fn document_from_decoded(file_name: &str, decoded: Decoded) -> Document {
 /// Add decoded content as new layer(s) on top of an existing document (used for
 /// "Place"/paste/drag-drop into an open doc). Content is centred on the canvas.
 pub fn add_decoded_as_layers(doc: &mut Document, file_name: &str, decoded: Decoded) -> Vec<LayerId> {
+    let prepared = prepare_layers(file_name, decoded, (doc.info.width, doc.info.height));
+    add_prepared_layers(doc, prepared)
+}
+
+/// Layers built from decoded content for a document of a given size, ready to be added with
+/// [`add_prepared_layers`]. Building the tile grids is the expensive part of placing an image,
+/// so this split lets it run off the UI thread (it is serializable through
+/// [`container::to_transport`] for Web Workers).
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct PreparedLayers {
+    pub color_info: Option<String>,
+    /// (name, content, storage format), bottom first.
+    pub layers: Vec<(String, LayerKind, PixelFormat)>,
+}
+
+/// Build the layers for placing `decoded` centred on a `doc_size` canvas.
+pub fn prepare_layers(file_name: &str, decoded: Decoded, doc_size: (u32, u32)) -> PreparedLayers {
+    let color_info = decoded_color_info(&decoded);
+    PreparedLayers { color_info, layers: decoded_layers(file_name, decoded, Some(doc_size)) }
+}
+
+/// Add layers built by [`prepare_layers`] on top of `doc`; returns the new layer ids.
+pub fn add_prepared_layers(doc: &mut Document, prepared: PreparedLayers) -> Vec<LayerId> {
     if doc.info.source_profile.is_none() {
-        doc.info.source_profile = decoded_color_info(&decoded);
+        doc.info.source_profile = prepared.color_info;
     }
-    let size = (doc.info.width, doc.info.height);
     let mut ids = vec![];
-    for (name, kind, f) in decoded_layers(file_name, decoded, Some(size)) {
+    for (name, kind, f) in prepared.layers {
         doc.info.format = doc.info.format.max(f);
         let id = doc.alloc_layer_id();
         doc.insert_layer_above(Layer::new(id, name, kind), None);
