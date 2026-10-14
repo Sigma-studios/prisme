@@ -3,7 +3,7 @@
 use crate::actions::{shortcut_matches, Action, Binding, Keymap};
 use crate::app::AppState;
 use crate::theme;
-use egui::{Button, RichText, TextEdit, Ui, Vec2};
+use egui::{Button, Color32, Rect, RichText, Sense, Stroke, TextEdit, Ui, Vec2};
 use egui_phosphor::regular as ph;
 
 pub const TITLE: &str = "Keyboard Shortcuts";
@@ -110,6 +110,8 @@ pub fn ui(s: &mut AppState, ui: &mut Ui) {
     let defaults = Keymap::default();
     let (st, km) = (&mut s.dialogs.shortcuts, &mut s.settings.keymap);
     egui::Frame::new().inner_margin(egui::Margin::symmetric(16, 10)).show(ui, |ui| {
+        // Keep names and keys close enough to scan across on wide tabs.
+        ui.set_max_width(ui.available_width().min(720.0));
         ui.horizontal(|ui| {
             ui.label(RichText::new(format!("{} {TITLE}", ph::KEYBOARD)).size(18.0).strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -148,11 +150,11 @@ pub fn ui(s: &mut AppState, ui: &mut Ui) {
                 any = true;
                 ui.add_space(6.0);
                 ui.label(RichText::new(cat.to_uppercase()).small().strong().color(theme::TEXT_DIM));
-                egui::Grid::new(("keys", cat)).striped(true).num_columns(3).min_col_width(24.0).show(ui, |ui| {
-                    for a in rows {
-                        row(ui, &ctx, st, km, &defaults, a);
-                    }
-                });
+                ui.spacing_mut().item_spacing.y = 1.0;
+                for a in rows {
+                    row(ui, &ctx, st, km, &defaults, a);
+                }
+                ui.spacing_mut().item_spacing.y = 5.0;
             }
             if !any {
                 ui.add_space(24.0);
@@ -162,42 +164,70 @@ pub fn ui(s: &mut AppState, ui: &mut Ui) {
     });
 }
 
+/// Rounded keycaps right-aligned so they end at `right`; returns the left edge used.
+fn keycaps(ui: &Ui, right: f32, cy: f32, parts: &[String], text: Color32, edge: Color32) -> f32 {
+    let v = ui.visuals();
+    let painter = ui.painter();
+    let font = egui::FontId::proportional(13.0);
+    let mut x = right;
+    for p in parts.iter().rev() {
+        let g = painter.layout_no_wrap(p.clone(), font.clone(), text);
+        let w = (g.size().x + 14.0).max(24.0);
+        let r = Rect::from_min_size(egui::pos2(x - w, cy - 11.0), Vec2::new(w, 22.0));
+        // Keycap: a darker lip under a raised face with a hairline border.
+        painter.rect_filled(r.translate(Vec2::new(0.0, 1.5)), 5.0, v.extreme_bg_color);
+        painter.rect_filled(r, 5.0, v.widgets.hovered.bg_fill);
+        painter.rect_stroke(r, 5.0, Stroke::new(1.0, edge), egui::StrokeKind::Inside);
+        painter.galley(r.center() - g.size() * 0.5, g, text);
+        x = r.left() - 4.0;
+    }
+    x
+}
+
 fn row(ui: &mut Ui, ctx: &egui::Context, st: &mut ShortcutsTab, km: &mut Keymap, defaults: &Keymap, a: Action) {
-    ui.add_sized([240.0, 20.0], egui::Label::new(display_name(a)).truncate());
+    let mac = ctx.os() == egui::os::OperatingSystem::Mac;
     let pending = st.conflict.filter(|c| c.0 == a);
     let capturing = st.rebinding == Some(a);
-    let (txt, col) = if capturing {
-        ("press a key…".to_string(), theme::ACCENT)
-    } else if let Some((_, b, _)) = pending {
-        (b.label(ctx), theme::WARN)
-    } else {
-        match km.label(ctx, a) {
-            l if l.is_empty() => ("—".to_string(), theme::TEXT_DIM),
-            l => (l, theme::TEXT),
-        }
-    };
-    let r = ui.add(Button::new(RichText::new(txt).color(col)).min_size(Vec2::new(140.0, 0.0)).selected(capturing)).on_hover_text("Click to rebind · right-click to clear");
-    if r.clicked() {
-        st.rebinding = Some(a);
-        st.conflict = None;
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 32.0), Sense::click());
+    let resp = resp.on_hover_text("Click to rebind · right-click to clear");
+    let v = ui.visuals().clone();
+    let edge = v.text_color().gamma_multiply(0.22);
+    if resp.hovered() || capturing || pending.is_some() {
+        ui.painter().rect_filled(rect, 6.0, v.faint_bg_color);
     }
-    if r.secondary_clicked() {
-        km.set(a, None);
-        st.rebinding = None;
+    ui.painter().text(rect.left_center() + Vec2::new(10.0, 0.0), egui::Align2::LEFT_CENTER, display_name(a), egui::FontId::proportional(14.0), v.widgets.inactive.fg_stroke.color);
+    // Fixed reset slot on the right so keycaps line up whether or not it shows.
+    let reset = Rect::from_center_size(egui::pos2(rect.right() - 18.0, rect.center().y), Vec2::splat(22.0));
+    let right = reset.left() - 8.0;
+    let cy = rect.center().y;
+    if capturing {
+        keycaps(ui, right, cy, &["Press keys…".to_string()], theme::ACCENT, theme::ACCENT);
+    } else if let Some((_, b, _)) = pending {
+        keycaps(ui, right, cy, &b.parts(mac), theme::WARN, theme::WARN);
+    } else if let Some(b) = km.get(a) {
+        keycaps(ui, right, cy, &b.parts(mac), v.widgets.inactive.fg_stroke.color, edge);
+    } else {
+        ui.painter().text(egui::pos2(right, cy), egui::Align2::RIGHT_CENTER, "Not set", egui::FontId::proportional(13.0), v.weak_text_color());
     }
     let def = defaults.get(a);
     if km.get(a) != def {
         let tip = format!("Reset to {}", def.map(|b| b.label(ctx)).unwrap_or_else(|| "none".into()));
-        if ui.small_button(ph::ARROW_COUNTER_CLOCKWISE).on_hover_text(tip).clicked() {
+        if ui.put(reset, Button::new(ph::ARROW_COUNTER_CLOCKWISE).frame(false)).on_hover_text(tip).clicked() {
             assign(st, km, a, def);
         }
-    } else {
-        ui.label("");
     }
-    ui.end_row();
+    if resp.clicked() {
+        st.rebinding = Some(a);
+        st.conflict = None;
+    }
+    if resp.secondary_clicked() {
+        km.set(a, None);
+        st.rebinding = None;
+    }
     if let Some((_, b, holder)) = pending {
-        ui.label(RichText::new(format!("{} Already used by {}", ph::WARNING, display_name(holder))).color(theme::WARN));
         ui.horizontal(|ui| {
+            ui.add_space(10.0);
+            ui.label(RichText::new(format!("{} Already used by {}", ph::WARNING, display_name(holder))).color(theme::WARN));
             if ui.button("Replace").clicked() {
                 km.set(a, Some(b)); // unbinds the holder
                 st.conflict = None;
@@ -206,7 +236,5 @@ fn row(ui: &mut Ui, ctx: &egui::Context, st: &mut ShortcutsTab, km: &mut Keymap,
                 st.conflict = None;
             }
         });
-        ui.label("");
-        ui.end_row();
     }
 }

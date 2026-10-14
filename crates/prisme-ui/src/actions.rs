@@ -146,8 +146,31 @@ impl Binding {
         KeyboardShortcut::new(m, self.key)
     }
 
+    /// Keycap parts in platform order: mac `⌥ ⇧ ⌘ K` (Phosphor glyphs: the UI font lacks ⇧/⌥),
+    /// elsewhere `Ctrl Alt Shift K`. Keys use their symbol where one exists (`[`, not "OpenBracket").
+    pub fn parts(&self, mac: bool) -> Vec<String> {
+        let mut v: Vec<String> = vec![];
+        let mut push = |on: bool, s: &str| {
+            if on {
+                v.push(s.to_string());
+            }
+        };
+        if mac {
+            push(self.alt, egui_phosphor::regular::OPTION);
+            push(self.shift, egui_phosphor::regular::ARROW_FAT_UP);
+            push(self.command, egui_phosphor::regular::COMMAND);
+        } else {
+            push(self.command, "Ctrl");
+            push(self.alt, "Alt");
+            push(self.shift, "Shift");
+        }
+        v.push(self.key.symbol_or_name().to_string());
+        v
+    }
+
+    /// Text form for menus and search (egui picks symbols the font can draw).
     pub fn label(&self, ctx: &egui::Context) -> String {
-        ctx.format_shortcut(&self.shortcut())
+        ctx.format_shortcut(&self.shortcut()).replace(self.key.name(), self.key.symbol_or_name())
     }
 
     /// Does query token `t` (lowercase) name one of this binding's modifiers or its key?
