@@ -13,7 +13,7 @@ pub mod scopes;
 pub mod upload;
 
 pub use context::GpuContext;
-pub use display::{DisplayParams, DisplayRenderer};
+pub use display::{DisplayOutput, DisplayParams, DisplayRenderer, HighlightMode};
 pub use engine::{Engine, EvalFormat, EvalRequest, LayerRasterizer, RenderSource};
 pub use image::GpuImage;
 pub use readback::Readback;

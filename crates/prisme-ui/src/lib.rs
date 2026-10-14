@@ -7,6 +7,7 @@ pub mod canvas;
 pub mod commands;
 pub mod dialogs;
 pub mod doc;
+pub mod hdr;
 pub mod jobs;
 pub mod outline;
 pub mod panels;
@@ -30,7 +31,12 @@ pub fn wgpu_options() -> egui_wgpu::WgpuConfiguration {
         required_limits: prisme_gpu::GpuContext::required_limits(&adapter.limits()),
         ..Default::default()
     });
-    egui_wgpu::WgpuConfiguration { wgpu_setup: WgpuSetup::CreateNew(create), ..Default::default() }
+    egui_wgpu::WgpuConfiguration {
+        wgpu_setup: WgpuSetup::CreateNew(create),
+        // HDR: Rgba16Float surface with a runtime-switchable colour space where available.
+        target_format_selector: Some(std::sync::Arc::new(hdr::select_surface)),
+        ..Default::default()
+    }
 }
 
 fn wgpu_backends() -> egui_wgpu::wgpu::Backends {

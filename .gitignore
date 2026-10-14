@@ -2,3 +2,4 @@
 /apps/prisme-web/dist
 *.prisme
 .DS_Store
+/.claude/

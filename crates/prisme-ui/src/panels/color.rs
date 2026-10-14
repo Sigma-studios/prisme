@@ -125,9 +125,24 @@ pub fn ui(s: &mut AppState, ui: &mut Ui) {
             }
         }
     }
-    let oog = srgb().from_working([color[0], color[1], color[2]]).iter().any(|v| *v < -0.002 || *v > 1.002);
-    if oog {
-        ui.label(RichText::new("⚠ Outside sRGB (shown clipped)").small().color(theme::WARN));
+    // Unclamped readout: HDR colours (e.g. picked from the canvas) can exceed SDR white.
+    let lin = srgb().matrix_from_working().apply([color[0], color[1], color[2]]);
+    ui.label(
+        RichText::new(format!("Linear sRGB  {:.3}  {:.3}  {:.3}", lin[0], lin[1], lin[2]))
+            .small()
+            .monospace()
+            .color(theme::TEXT_DIM),
+    )
+    .on_hover_text(format!(
+        "Working (linear Rec.2020): {:.4}, {:.4}, {:.4}\n1.0 = SDR reference white; values above it are HDR highlights.",
+        color[0], color[1], color[2]
+    ));
+    let peak = lin[0].max(lin[1]).max(lin[2]);
+    if peak > 1.002 {
+        ui.label(RichText::new(format!("☀ {peak:.2}× SDR white (sliders show it clipped)")).small().color(theme::WARN));
+    }
+    if lin.iter().any(|v| *v < -0.002) {
+        ui.label(RichText::new("⚠ Outside sRGB gamut (shown clipped)").small().color(theme::WARN));
     }
 
     if changed {

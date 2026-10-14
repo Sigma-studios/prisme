@@ -1,6 +1,9 @@
 // Canvas display pass: maps framebuffer pixels to document space, samples the evaluated
 // level image, composites over a checkerboard and applies the display transform
 // (analytic matrix + transfer, or a baked 3D LUT from the display ICC profile).
+// HDR (hdr.x = 1, extended-range sRGB-encoded surface): analytic working -> linear BT.709,
+// 1.0 = SDR reference white, highlights clipped or rolled off to the display headroom, then
+// the unbounded, sign-mirrored sRGB encoding. Mirrors prisme_color::hdr.
 
 struct View {
     fb_to_doc0: vec4<f32>,  // row 0: a b tx
@@ -23,6 +26,7 @@ struct View {
     bg: vec4<f32>,          // display-encoded
     chk_a: vec4<f32>,
     chk_b: vec4<f32>,
+    hdr: vec4<f32>,         // x: 1 = extended sRGB (HDR) · y: peak · z: 1 soft roll-off · w: knee
 };
 
 @group(0) @binding(0) var<uniform> v: View;
@@ -52,6 +56,28 @@ fn oetf(x: f32) -> f32 {
 fn srgb_eotf(x: f32) -> f32 {
     if (x <= 0.04045) { return x / 12.92; }
     return pow((x + 0.055) / 1.055, 2.4);
+}
+// Extended sRGB encoding: sRGB OETF, mirrored for negatives and unbounded above 1.
+fn enc_ext(x: f32) -> f32 {
+    let a = abs(x);
+    var e: f32;
+    if (a <= 0.0031308) { e = a * 12.92; } else { e = 1.055 * pow(a, 1.0 / 2.4) - 0.055; }
+    return select(e, -e, x < 0.0);
+}
+fn highlights(l: vec3<f32>) -> vec3<f32> {
+    let peak = v.hdr.y;
+    let k = v.hdr.w;
+    if (v.hdr.z < 0.5 || peak - k < 1e-4) {
+        if (v.hdr.z < 0.5) { return min(l, vec3<f32>(peak)); }
+        // No room for a shoulder: clip by scaling (keeps hue, like the roll-off).
+        let m0 = max(max(l.r, l.g), l.b);
+        return select(l, l * (peak / m0), m0 > peak);
+    }
+    let m = max(max(l.r, l.g), l.b);
+    if (m <= k) { return l; }
+    let span = peak - k;
+    let t = k + span * (1.0 - exp(-(m - k) / span));
+    return l * (t / m);
 }
 fn hash12(p: vec2<f32>) -> f32 {
     var p3 = fract(vec3<f32>(p.xyx) * 0.1031);
@@ -83,7 +109,12 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         let c = fetch(doc * v.level_scale) * vec4<f32>(vec3<f32>(exp2(v.exposure)), 1.0);
         // working -> display
         var disp: vec3<f32>;
-        if (v.has_lut > 0.5) {
+        if (v.hdr.x > 0.5) {
+            let rgb = select(vec3<f32>(0.0), c.rgb / c.a, c.a > 1e-6);
+            let m = mat3x3<f32>(v.disp0.xyz, v.disp1.xyz, v.disp2.xyz);
+            let l = highlights(m * rgb);
+            disp = vec3<f32>(enc_ext(l.r), enc_ext(l.g), enc_ext(l.b));
+        } else if (v.has_lut > 0.5) {
             let n = f32(textureDimensions(lut).x);
             let rgb = select(vec3<f32>(0.0), c.rgb / c.a, c.a > 1e-6);
             let e = vec3<f32>(
@@ -101,7 +132,10 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         // checkerboard in screen space
         let k = floor(fb / v.checker);
         let chk = select(v.chk_a.rgb, v.chk_b.rgb, (i32(k.x) + i32(k.y)) % 2 == 0);
-        out = mix(chk, clamp(disp, vec3<f32>(0.0), vec3<f32>(1.0)), clamp(c.a, 0.0, 1.0));
+        if (v.hdr.x < 0.5) {
+            disp = clamp(disp, vec3<f32>(0.0), vec3<f32>(1.0));
+        }
+        out = mix(chk, disp, clamp(c.a, 0.0, 1.0));
     }
     if (v.dither > 0.5) {
         out = out + (hash12(fb) - 0.5) / 255.0;

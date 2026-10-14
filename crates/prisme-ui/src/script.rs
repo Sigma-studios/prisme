@@ -4,7 +4,8 @@
 //! `new:W,H` · `open:PATH` · `tool:<ToolKind debug name>` · `drag:x0,y0,x1,y1` (document px) ·
 //! `click:x,y` · `key:Enter|Escape` · `type:text` · `node:<kind>` · `param:key=value` (selected node) ·
 //! `fg:#rrggbb` · `wait:N` (frames) · `shot:PATH` (window screenshot PNG) · `export:PATH` (PNG at full res) ·
-//! `save:PATH` (.prisme) · `undo` · `redo` · `toggle-nodes` · `quit`.
+//! `save:PATH` (.prisme) · `undo` · `redo` · `toggle-nodes` · `hdr:auto|on|off` (persisted setting) ·
+//! `hdr-status` (log surface format / colour space / headroom) · `quit`.
 
 use crate::app::AppState;
 use prisme_tools::{Phase, ToolInput, ToolKey, ToolKind};
@@ -188,6 +189,14 @@ pub fn step(s: &mut AppState, sc: &mut Script, ctx: &egui::Context) {
         "undo" => crate::commands::run_action(s, crate::actions::Action::Undo, ctx),
         "redo" => crate::commands::run_action(s, crate::actions::Action::Redo, ctx),
         "toggle-nodes" => crate::commands::run_action(s, crate::actions::Action::ToggleNodeOutput, ctx),
+        "hdr" => {
+            s.settings.hdr_mode = match arg.to_ascii_lowercase().as_str() {
+                "on" => crate::hdr::HdrMode::On,
+                "off" => crate::hdr::HdrMode::Off,
+                _ => crate::hdr::HdrMode::Auto,
+            };
+        }
+        "hdr-status" => log::info!("script: hdr-status {:?} (mode {:?}, highlights {:?})", s.hdr, s.settings.hdr_mode, s.settings.hdr_highlights),
         "quit" => {
             s.dialogs.allow_quit = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);

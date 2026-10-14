@@ -432,6 +432,8 @@ fn prefs(s: &mut AppState, ctx: &egui::Context) {
         });
         ui.label(RichText::new(format!("Platform: {} · fonts loaded: {}", prisme_platform::platform_name(), s.fonts.families().len())).small().color(theme::TEXT_DIM));
         ui.separator();
+        ui.collapsing("Display", |ui| display_prefs(s, ui));
+        ui.separator();
         shortcuts = ui.button(format!("{} Keyboard Shortcuts…", egui_phosphor::regular::KEYBOARD)).clicked();
     });
     if shortcuts {
@@ -439,6 +441,61 @@ fn prefs(s: &mut AppState, ctx: &egui::Context) {
         open = false;
     }
     s.dialogs.prefs_open = open;
+}
+
+fn display_prefs(s: &mut AppState, ui: &mut egui::Ui) {
+    use crate::hdr::HdrMode;
+    use prisme_gpu::HighlightMode;
+    let hdr = s.hdr.clone();
+    ui.add_enabled_ui(hdr.capable, |ui| {
+        ui.horizontal(|ui| {
+            ui.label("HDR output");
+            ComboBox::from_id_salt("hdr-mode").selected_text(s.settings.hdr_mode.label()).show_ui(ui, |ui| {
+                for m in HdrMode::ALL {
+                    ui.selectable_value(&mut s.settings.hdr_mode, m, m.label());
+                }
+            });
+        })
+        .response
+        .on_hover_text("Auto: extended range when the display reports HDR capability. Values above 1.0 (SDR white) are shown brighter than white; the UI stays at SDR white.");
+    });
+    let state = if hdr.active {
+        let cur = hdr.headroom.map(|h| format!("{h:.2}×")).unwrap_or_else(|| "unknown".into());
+        let pot = hdr.potential.map(|p| format!(", up to {p:.1}×")).unwrap_or_default();
+        format!("Active — headroom {cur}{pot} SDR white; highlights limited to {:.2}×", hdr.peak)
+    } else {
+        format!("Inactive — {}", hdr.reason)
+    };
+    ui.label(RichText::new(state).small().color(if hdr.active || hdr.capable { theme::TEXT_DIM } else { theme::WARN }));
+    if let (Some(f), Some(c)) = (hdr.format, hdr.color_space) {
+        ui.label(RichText::new(format!("Surface: {f:?} · {c:?}")).small().color(theme::TEXT_DIM));
+    }
+    ui.add_enabled_ui(hdr.capable, |ui| {
+        ui.horizontal(|ui| {
+            ui.label("Highlights");
+            ui.selectable_value(&mut s.settings.hdr_highlights, HighlightMode::SoftRolloff, "Soft roll-off")
+                .on_hover_text("Compress highlights smoothly from 75% of the display peak (keeps hue and detail)");
+            ui.selectable_value(&mut s.settings.hdr_highlights, HighlightMode::Clip, "Clip at display peak");
+        });
+        // Only meaningful where the platform doesn't report the headroom (browsers).
+        ui.add_enabled_ui(hdr.headroom.is_none(), |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Assumed display peak");
+                ui.add(DragValue::new(&mut s.settings.hdr_peak_fallback).range(1.0..=16.0).speed(0.05).suffix("× SDR white"));
+            })
+            .response
+            .on_hover_text("Used when the platform doesn't report the display's HDR headroom (web browsers). SDR white itself follows the OS brightness setting.");
+        });
+    });
+    ui.label(
+        RichText::new(if hdr.active {
+            "In HDR mode the OS/browser colour-manages the canvas (extended sRGB); the display ICC profile and dithering apply to SDR only."
+        } else {
+            "SDR: the canvas uses the display ICC profile when enabled (View menu)."
+        })
+        .small()
+        .color(theme::TEXT_DIM),
+    );
 }
 
 fn misc(s: &mut AppState, ctx: &egui::Context) {
