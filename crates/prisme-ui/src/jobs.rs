@@ -485,6 +485,7 @@ fn replace_or_add(s: &mut AppState, placeholder: Option<u64>, mut d: DocState, p
     d.path = path;
     if let Some(i) = placeholder.and_then(|p| s.docs.iter().position(|x| x.id == p)) {
         s.docs[i] = d;
+        crate::shortcuts::unfocus(s);
         s.active = i;
     } else {
         s.add_doc(d);

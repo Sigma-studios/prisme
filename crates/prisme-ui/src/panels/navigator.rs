@@ -4,7 +4,7 @@ use crate::app::AppState;
 use egui::{Color32, Sense, Stroke, Ui, Vec2};
 
 pub fn ui(s: &mut AppState, ui: &mut Ui) {
-    let Some(d) = s.docs.get(s.active) else { return super::no_doc(ui) };
+    let Some(d) = s.doc() else { return super::no_doc(ui) };
     let doc = d.doc().clone();
     let (w, h) = (doc.info.width as f32, doc.info.height as f32);
     let avail = ui.available_width().min(320.0);

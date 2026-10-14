@@ -13,6 +13,7 @@ pub mod panels;
 pub mod rasterizer;
 pub mod script;
 pub mod settings;
+pub mod shortcuts;
 pub mod theme;
 pub mod widgets;
 

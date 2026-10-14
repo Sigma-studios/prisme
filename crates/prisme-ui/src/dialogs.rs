@@ -1,6 +1,5 @@
 //! Modal-ish windows: new document, image/canvas size, PNG export, preferences, etc.
 
-use crate::actions::{Action, Binding};
 use crate::app::AppState;
 use crate::doc::DocState;
 use crate::theme;
@@ -47,7 +46,7 @@ pub struct Dialogs {
     pub confirm_close: Option<usize>,
     pub modify_sel: Option<(String, f32)>,
     pub recovery: Vec<(u64, String)>,
-    pub rebinding: Option<Action>,
+    pub shortcuts: crate::shortcuts::ShortcutsTab,
 }
 
 impl Dialogs {
@@ -406,63 +405,31 @@ fn prefs(s: &mut AppState, ctx: &egui::Context) {
         return;
     }
     let mut open = true;
-    // Capture a key for rebinding.
-    if let Some(a) = s.dialogs.rebinding {
-        let captured = ctx.input(|i| {
-            i.events.iter().find_map(|e| match e {
-                egui::Event::Key { key, pressed: true, modifiers, .. } if *key != egui::Key::Escape => {
-                    Some(Binding { key: *key, command: modifiers.command, shift: modifiers.shift, alt: modifiers.alt })
-                }
-                _ => None,
-            })
+    let mut shortcuts = false;
+    Window::new("Preferences").open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
+        ui.label(RichText::new("General").strong());
+        ui.horizontal(|ui| {
+            ui.label("Autosave every");
+            ui.add(DragValue::new(&mut s.settings.autosave_minutes).range(0.0..=60.0).suffix(" min"));
+            ui.label(RichText::new("(0 = off)").small().color(theme::TEXT_DIM));
         });
-        if let Some(b) = captured {
-            s.settings.keymap.set(a, Some(b));
-            s.dialogs.rebinding = None;
-        } else if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            s.dialogs.rebinding = None;
-        }
-    }
-    Window::new("Preferences").open(&mut open).default_size([460.0, 520.0]).show(ctx, |ui| {
-        ui.collapsing("General", |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Autosave every");
-                ui.add(DragValue::new(&mut s.settings.autosave_minutes).range(0.0..=60.0).suffix(" min"));
-                ui.label(RichText::new("(0 = off)").small().color(theme::TEXT_DIM));
-            });
-            ui.horizontal(|ui| {
-                ui.label("History memory budget");
-                let mut mb = s.docs.first().map(|d| d.history.budget_bytes as f32 / 1e6).unwrap_or(2048.0);
-                if ui.add(DragValue::new(&mut mb).range(64.0..=65536.0).suffix(" MB")).changed() {
-                    for d in &mut s.docs {
-                        d.history.budget_bytes = (mb * 1e6) as usize;
-                    }
+        ui.horizontal(|ui| {
+            ui.label("History memory budget");
+            let mut mb = s.docs.first().map(|d| d.history.budget_bytes as f32 / 1e6).unwrap_or(2048.0);
+            if ui.add(DragValue::new(&mut mb).range(64.0..=65536.0).suffix(" MB")).changed() {
+                for d in &mut s.docs {
+                    d.history.budget_bytes = (mb * 1e6) as usize;
                 }
-            });
-            ui.label(format!("Platform: {} · fonts loaded: {}", prisme_platform::platform_name(), s.fonts.families().len()));
-        });
-        ui.separator();
-        ui.label(RichText::new("Keyboard shortcuts — click a shortcut to rebind, right-click to clear").strong());
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            egui::Grid::new("keys").striped(true).num_columns(2).show(ui, |ui| {
-                for a in Action::all() {
-                    ui.label(a.name());
-                    let label = if s.dialogs.rebinding == Some(a) { "press a key…".to_string() } else { s.settings.keymap.label(ctx, a) };
-                    let r = ui.button(if label.is_empty() { "—".to_string() } else { label });
-                    if r.clicked() {
-                        s.dialogs.rebinding = Some(a);
-                    }
-                    if r.secondary_clicked() {
-                        s.settings.keymap.set(a, None);
-                    }
-                    ui.end_row();
-                }
-            });
-            if ui.button("Reset all shortcuts").clicked() {
-                s.settings.keymap = Default::default();
             }
         });
+        ui.label(RichText::new(format!("Platform: {} · fonts loaded: {}", prisme_platform::platform_name(), s.fonts.families().len())).small().color(theme::TEXT_DIM));
+        ui.separator();
+        shortcuts = ui.button(format!("{} Keyboard Shortcuts…", egui_phosphor::regular::KEYBOARD)).clicked();
     });
+    if shortcuts {
+        crate::shortcuts::open(s);
+        open = false;
+    }
     s.dialogs.prefs_open = open;
 }
 

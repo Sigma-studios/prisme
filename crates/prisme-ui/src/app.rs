@@ -210,11 +210,18 @@ fn install_display_profile(renderer: &mut DisplayRenderer, rs: &egui_wgpu::Rende
 }
 
 impl AppState {
+    /// The active document; None while a non-document tab (Keyboard Shortcuts) is focused.
     pub fn doc(&self) -> Option<&DocState> {
+        if self.dialogs.shortcuts.focused {
+            return None;
+        }
         self.docs.get(self.active)
     }
 
     pub fn doc_mut(&mut self) -> Option<&mut DocState> {
+        if self.dialogs.shortcuts.focused {
+            return None;
+        }
         self.docs.get_mut(self.active)
     }
 
@@ -223,6 +230,7 @@ impl AppState {
     }
 
     pub fn add_doc(&mut self, d: DocState) {
+        crate::shortcuts::unfocus(self);
         self.docs.push(d);
         self.active = self.docs.len() - 1;
     }
@@ -352,6 +360,10 @@ impl eframe::App for PrismeApp {
         egui::Panel::bottom("status").exact_size(22.0).show(ui, |ui| status_bar(s, ui));
         egui::Panel::left("toolbar").exact_size(44.0).resizable(false).show(ui, |ui| toolbar(s, ui));
 
+        if std::mem::take(&mut s.dialogs.shortcuts.reveal)
+            && let Some(loc) = self.dock.find_tab(&Tab::Canvas) {
+                let _ = self.dock.set_active_tab(loc);
+            }
         egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
             let mut style = Style::from_egui(ui.style().as_ref());
             style.tab_bar.bg_fill = theme::BG0;

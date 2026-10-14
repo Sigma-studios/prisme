@@ -457,7 +457,7 @@ fn sync(ed: &mut NodeEditor, doc: &Document) {
 }
 
 pub fn ui(s: &mut AppState, ui: &mut Ui) {
-    let Some(d) = s.docs.get(s.active) else { return super::no_doc(ui) };
+    let Some(d) = s.doc() else { return super::no_doc(ui) };
     let doc_id = d.id;
     let doc = d.doc().clone();
     let version = d.version;

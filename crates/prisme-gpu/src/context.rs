@@ -12,9 +12,10 @@ impl GpuContext {
 
     /// Limits Prisme needs on top of WebGPU defaults (none beyond defaults today).
     pub fn required_limits(adapter_limits: &wgpu::Limits) -> wgpu::Limits {
-        let mut l = wgpu::Limits::default();
+        // Clamp the defaults to what the adapter supports: requesting more fails device creation.
+        let mut l = wgpu::Limits::default().or_worse_values_from(adapter_limits);
         // Use the largest textures the adapter offers (documents can be big).
-        l.max_texture_dimension_2d = adapter_limits.max_texture_dimension_2d.max(8192);
+        l.max_texture_dimension_2d = adapter_limits.max_texture_dimension_2d;
         l.max_buffer_size = adapter_limits.max_buffer_size;
         l.max_storage_buffer_binding_size = adapter_limits.max_storage_buffer_binding_size;
         l

@@ -75,6 +75,24 @@ impl Action {
         v.extend(ToolKind::ALL.iter().map(|t| Tool(*t)));
         v
     }
+
+    /// Display order of `category()` groups.
+    pub const CATEGORIES: [&'static str; 9] = ["Tools", "File", "Edit", "Select", "Layer", "Image", "View", "Color", "App"];
+
+    pub fn category(&self) -> &'static str {
+        use Action::*;
+        match self {
+            Tool(_) | BrushSmaller | BrushBigger => "Tools",
+            New | Open | Save | SaveAs | Export | Close => "File",
+            Undo | Redo | Cut | Copy | CopyMerged | Paste | PasteNewDoc | Delete | FillFg | FillBg => "Edit",
+            SelectAll | Deselect | InvertSelection | SaveSelectionMask => "Select",
+            NewLayer | DuplicateLayer | DeleteLayer | MergeDown | GroupLayer | AddMask => "Layer",
+            ImageSize | CanvasSize => "Image",
+            ZoomIn | ZoomOut | ZoomFit | Zoom100 | RotateViewLeft | RotateViewRight | ResetView | ToggleNodeOutput => "View",
+            SwapColors | ResetColors | PickScreenColor => "Color",
+            Preferences => "App",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,6 +137,46 @@ impl Binding {
     pub fn label(&self, ctx: &egui::Context) -> String {
         ctx.format_shortcut(&self.shortcut())
     }
+
+    /// Does query token `t` (lowercase) name one of this binding's modifiers or its key?
+    fn token_matches(&self, t: &str) -> bool {
+        match t {
+            "cmd" | "command" | "ctrl" | "control" | "ctl" | "super" | "meta" | "⌘" | "^" => self.command,
+            "shift" | "⇧" => self.shift,
+            "alt" | "option" | "opt" | "⌥" => self.alt,
+            _ => t == self.key.name().to_lowercase() || t == self.key.symbol_or_name().to_lowercase(),
+        }
+    }
+}
+
+/// Fuzzy-ish, case-insensitive match of `q` against an action name and its shortcut
+/// (`label` is the platform-formatted one, e.g. "⌘S" / "Ctrl+S").
+pub fn shortcut_matches(name: &str, b: Option<Binding>, label: &str, q: &str) -> bool {
+    let q = q.trim().to_lowercase();
+    if q.is_empty() {
+        return true;
+    }
+    let name = name.to_lowercase();
+    let compact = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+    let (cq, cn) = (compact(&q), compact(&name));
+    // Name: every word is a substring, or the whole query is an in-order subsequence.
+    if q.split_whitespace().all(|t| name.contains(t)) {
+        return true;
+    }
+    let mut it = cn.chars();
+    if cq.chars().count() >= 3 && cq.chars().all(|c| it.any(|n| n == c)) {
+        return true;
+    }
+    let Some(b) = b else { return false };
+    // Shortcut: formatted label ("⌘⇧s", "ctrl+s"), or every token is a modifier/key of the binding.
+    let label = label.to_lowercase();
+    if !label.is_empty() && (label.contains(&cq) || compact(&label.replace('+', "")) == compact(&cq.replace('+', ""))) {
+        return true;
+    }
+    // "+" separates tokens unless it is the key itself ("cmd +").
+    let toks: Vec<&str> = q.split(|c: char| c.is_whitespace() || c == '+').filter(|t| !t.is_empty()).collect();
+    let toks = if toks.is_empty() { vec!["+"] } else { toks };
+    toks.iter().all(|t| b.token_matches(t))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -220,6 +278,11 @@ impl Keymap {
         self.get(a).map(|b| b.label(ctx)).unwrap_or_default()
     }
 
+    /// The action other than `except` currently bound to `b`.
+    pub fn holder(&self, b: Binding, except: Action) -> Option<Action> {
+        Action::all().into_iter().find(|a| *a != except && self.get(*a) == Some(b))
+    }
+
     /// Consume triggered actions from this frame's input.
     pub fn triggered(&self, ctx: &egui::Context) -> Vec<Action> {
         let mut out = vec![];
@@ -234,5 +297,43 @@ impl Keymap {
             }
         });
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_action_has_a_listed_category() {
+        for a in Action::all() {
+            assert!(Action::CATEGORIES.contains(&a.category()), "{a:?}");
+        }
+    }
+
+    #[test]
+    fn search_by_name_and_shortcut() {
+        let save = Some(Binding::cmd(Key::S));
+        assert!(shortcut_matches("Save", save, "⌘S", "sav"));
+        assert!(shortcut_matches("Tool: Brush", None, "", "BRUSH"));
+        assert!(shortcut_matches("Save Selection Mask", None, "", "sel mask"));
+        assert!(shortcut_matches("Save", save, "⌘S", "⌘s"));
+        assert!(shortcut_matches("Save", save, "Ctrl+S", "ctrl+s"));
+        assert!(shortcut_matches("Save", save, "⌘S", "cmd s"));
+        assert!(shortcut_matches("Save", save, "⌘S", "Ctrl+S"));
+        assert!(!shortcut_matches("Save", save, "⌘S", "shift s"));
+        assert!(!shortcut_matches("Save", save, "⌘S", "brush"));
+        assert!(!shortcut_matches("Open", None, "", "cmd o"));
+        let zoom = Some(Binding::cmd(Key::Equals));
+        assert!(shortcut_matches("Zoom In", zoom, "⌘=", "cmd ="));
+        let rot = Some(Binding::shift(Key::OpenBracket));
+        assert!(shortcut_matches("Rotate View Left", rot, "⇧[", "shift+["));
+    }
+
+    #[test]
+    fn holder_finds_conflicts() {
+        let k = Keymap::default();
+        assert_eq!(k.holder(Binding::cmd(Key::S), Action::Open), Some(Action::Save));
+        assert_eq!(k.holder(Binding::cmd(Key::S), Action::Save), None);
     }
 }

@@ -15,6 +15,10 @@ use std::sync::Arc;
 // ------------------------------------------------------------------ shortcuts
 
 pub fn handle_shortcuts(s: &mut AppState, ctx: &egui::Context) {
+    // Rebinding in the shortcuts tab swallows the keyboard.
+    if crate::shortcuts::capture(s, ctx) {
+        return;
+    }
     if ctx.input(|i| i.pointer.any_released()) {
         for d in &mut s.docs {
             d.history.seal();
@@ -98,6 +102,9 @@ fn tool_key(s: &mut AppState, key: &ToolKey) -> bool {
     let fg = s.settings.fg;
     let bg = s.settings.bg;
     let opts = s.settings.tools.clone();
+    if s.doc().is_none() {
+        return false; // no active document (e.g. the shortcuts tab)
+    }
     let Some(d) = s.docs.get_mut(s.active) else { return false };
     let Some(tool) = s.tools.get_mut(&tool_kind) else { return false };
     let had_working = d.working.is_some();
@@ -125,6 +132,7 @@ pub fn run_action(s: &mut AppState, a: Action, ctx: &egui::Context) {
         Action::Save => crate::jobs::save(s, false),
         Action::SaveAs => crate::jobs::save(s, true),
         Action::Export => crate::dialogs::open_export(s),
+        Action::Close if s.dialogs.shortcuts.focused => crate::shortcuts::close(s),
         Action::Close => {
             let i = s.active;
             close_doc(s, i)
@@ -648,7 +656,7 @@ fn item(ui: &mut Ui, s: &AppState, label: &str, a: Action) -> bool {
 pub fn menu_bar(s: &mut AppState, ui: &mut Ui, dock: &mut DockState<Tab>) {
     let ctx = ui.ctx().clone();
     let mut run: Option<Action> = None;
-    let has_doc = !s.docs.is_empty();
+    let has_doc = s.doc().is_some();
     ui.label(egui::RichText::new(format!("{} Prisme", egui_phosphor::regular::DIAMOND)).strong().color(crate::theme::ACCENT));
     ui.menu_button("File", |ui| {
         for (l, a) in [("New…", Action::New), ("Open…", Action::Open)] {
@@ -704,7 +712,7 @@ pub fn menu_bar(s: &mut AppState, ui: &mut Ui, dock: &mut DockState<Tab>) {
             }
         });
         ui.separator();
-        if item(ui, s, "Preferences & Shortcuts…", Action::Preferences) {
+        if item(ui, s, "Preferences…", Action::Preferences) {
             run = Some(Action::Preferences);
         }
     });
@@ -873,7 +881,7 @@ pub fn menu_bar(s: &mut AppState, ui: &mut Ui, dock: &mut DockState<Tab>) {
     });
     ui.menu_button("Help", |ui| {
         if ui.button("Keyboard Shortcuts…").clicked() {
-            s.dialogs.prefs_open = true;
+            crate::shortcuts::open(s);
             ui.close();
         }
         if ui.button("About Prisme").clicked() {
