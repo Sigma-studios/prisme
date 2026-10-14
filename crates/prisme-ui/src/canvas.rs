@@ -178,7 +178,7 @@ pub fn canvas_tab(s: &mut AppState, ui: &mut Ui) {
         run_tool(s, ev);
     }
     // Airbrush ticks.
-    if s.tools.get(&s.tool).is_some_and(|t| t.busy()) {
+    if s.tools.get(&s.tool).is_some_and(|t| t.ticking()) {
         let fg = s.settings.fg;
         let bg = s.settings.bg;
         let opts = s.settings.tools.clone();
@@ -238,6 +238,14 @@ pub fn blocked_reason(s: &AppState) -> Option<String> {
     let doc = s.doc()?.doc();
     let paint = tool.uses_brush() || tool == ToolKind::Fill || (tool == ToolKind::Gradient && !s.settings.tools.gradient_as_layer);
     let moves = matches!(tool, ToolKind::Move | ToolKind::Transform);
+    if tool == ToolKind::Liquify {
+        let l = doc.active()?;
+        return if l.lock.pixels {
+            Some(format!("“{}” has locked pixels", l.name))
+        } else {
+            l.raster().is_none().then(|| format!("“{}” is a {} layer — Liquify works on raster layer pixels", l.name, l.kind.type_name().to_lowercase()))
+        };
+    }
     if !paint && !moves {
         return None;
     }
@@ -327,8 +335,12 @@ pub fn apply_outcome(s: &mut AppState, outcome: ToolOutcome, busy: bool) {
     }
     // Drop untouched working copies when the tool is idle (nothing to commit).
     let text_editing = s.text_editing().is_some();
+    // A GPU Liquify session previews from its stroke: between strokes there's no working
+    // copy, so panel edits go straight to the history (and survive the bake).
+    let ticking = s.tools.get(&s.tool).is_some_and(|t| t.ticking());
     if let Some(d) = s.docs.get_mut(s.active)
-        && !busy && !text_editing && d.working.is_some() {
+        && (!busy || !ticking && d.stroke.as_ref().is_some_and(|st| st.gpu.is_liquify()))
+        && !text_editing && d.working.is_some() {
             d.working = None;
             if changed {
                 d.touch();
@@ -500,6 +512,7 @@ fn overlays(s: &mut AppState, ctx: &egui::Context, rect: Rect, painter: &egui::P
         ToolKind::Eraser => Some(s.settings.tools.eraser.size),
         ToolKind::Clone | ToolKind::Heal => Some(s.settings.tools.clone_brush.size),
         ToolKind::Smudge | ToolKind::Blur => Some(s.settings.tools.retouch_brush.size),
+        ToolKind::Liquify => Some(s.settings.tools.liquify.size),
         _ => None,
     };
     let hover = s.hover_doc;
@@ -674,6 +687,7 @@ fn doc_tabs(s: &mut AppState, ui: &mut Ui) {
             frame.show(ui, |ui| {
                 if ui.add(egui::Label::new(egui::RichText::new(title).color(if selected { theme::TEXT } else { theme::TEXT_DIM })).sense(Sense::click())).clicked()
                     && !selected {
+                        crate::stroke::commit_liquify(s);
                         if let Some(d) = s.doc_mut() {
                             d.cancel_working();
                         }

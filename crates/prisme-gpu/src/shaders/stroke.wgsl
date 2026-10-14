@@ -302,3 +302,105 @@ fn k_stroke_view(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     textureStore(out_tex, out_coord(gid), o);
 }
+
+// ---- Liquify: the layer snapshot warped through a displacement field (backward map:
+// output p samples base at p + d(p)). Mirrors prisme_tools::liquify::warp_rect at level 0.
+// in0 = regular upload at this level (optional), in1 = base (level 0, straight, covers the
+// working area), in2 = field nodes (dx, dy, freeze, 0), in3 = selection (level 0, optional).
+// P0 = [2^mip, node step, tint freeze, bicubic], P1 = working rect (document px), P2.x = default.
+
+fn lq_node(i: vec2<i32>) -> vec4<f32> {
+    return textureLoad(in2, clamp(i, vec2<i32>(0), info.in2.zw - 1), 0);
+}
+
+// Bilinear field value at a document position (edge nodes extend outwards).
+fn lq_field(pc: vec2<f32>) -> vec4<f32> {
+    let u = (pc - pv(1u).xy) / pf(1u) - 0.5;
+    let f = floor(u);
+    let t = u - f;
+    let i = vec2<i32>(f);
+    let a = mix(lq_node(i), lq_node(i + vec2<i32>(1, 0)), t.x);
+    let b = mix(lq_node(i + vec2<i32>(0, 1)), lq_node(i + vec2<i32>(1, 1)), t.x);
+    return mix(a, b, t.y);
+}
+
+// Premultiplied base pixel, clamped to the working area (edge extend).
+fn lq_px(q: vec2<i32>) -> vec4<f32> {
+    let fr = vec4<i32>(pv(1u));
+    let r = clamp(q, fr.xy, fr.zw - 1) - info.in1.xy;
+    if (!inside(r, info.in1.zw)) { return vec4<f32>(0.0); }
+    let v = textureLoad(in1, r, 0);
+    return vec4<f32>(v.rgb * v.a, v.a);
+}
+
+fn lq_cubic(t: f32) -> vec4<f32> {
+    let t2 = t * t;
+    let t3 = t2 * t;
+    return vec4<f32>(-0.5 * t3 + t2 - 0.5 * t, 1.5 * t3 - 2.5 * t2 + 1.0, -1.5 * t3 + 2.0 * t2 + 0.5 * t, 0.5 * t3 - 0.5 * t2);
+}
+
+// Premultiplied sample (pixel centres at +0.5); Catmull-Rom clamped to the 4 nearest.
+fn lq_sample(s: vec2<f32>, bicubic: bool) -> vec4<f32> {
+    let f = s - 0.5;
+    let fl = floor(f);
+    let t = f - fl;
+    let i = vec2<i32>(fl);
+    let n0 = lq_px(i);
+    let n1 = lq_px(i + vec2<i32>(1, 0));
+    let n2 = lq_px(i + vec2<i32>(0, 1));
+    let n3 = lq_px(i + vec2<i32>(1, 1));
+    if (!bicubic) { return mix(mix(n0, n1, t.x), mix(n2, n3, t.x), t.y); }
+    let wx = lq_cubic(t.x);
+    let wy = lq_cubic(t.y);
+    var acc = vec4<f32>(0.0);
+    for (var y = 0; y < 4; y = y + 1) {
+        for (var x = 0; x < 4; x = x + 1) {
+            acc = acc + lq_px(i + vec2<i32>(x - 1, y - 1)) * (wx[x] * wy[y]);
+        }
+    }
+    return clamp(acc, min(min(n0, n1), min(n2, n3)), max(max(n0, n1), max(n2, n3)));
+}
+
+// Premultiplied warped value at document position pc.
+fn lq_warp(pc: vec2<f32>, bicubic: bool) -> vec4<f32> {
+    let fr = pv(1u);
+    let d = lq_field(pc);
+    let s = clamp(pc + d.xy, fr.xy + 0.5, fr.zw - 0.5);
+    var v = lq_sample(s, bicubic);
+    if (info.connected.w != 0u) {
+        let q = vec2<i32>(floor(pc));
+        v = mix(lq_px(q), v, clamp(ld3(q).r, 0.0, 1.0));
+    }
+    if (pf(2u) > 0.5 && d.z > 0.0) {
+        let k = 0.45 * clamp(d.z, 0.0, 1.0);
+        v = v * (1.0 - k) + vec4<f32>(0.85, 0.12, 0.15, 1.0) * k;
+    }
+    return v;
+}
+
+// Layer content at this level (straight), warped inside the working area.
+@compute @workgroup_size(8, 8)
+fn k_liquify(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (!in_bounds(gid)) { return; }
+    let p = gpos(gid);
+    let k = pf(0u);
+    let fr = pv(1u);
+    let c = (vec2<f32>(p) + 0.5) * k;
+    var o = vec4<f32>(pf(8u));
+    if (c.x >= fr.x && c.y >= fr.y && c.x < fr.z && c.y < fr.w) {
+        var v: vec4<f32>;
+        if (k < 1.5) {
+            v = lq_warp(c, pf(3u) > 0.5);
+        } else {
+            // 2x2 samples over the level pixel's footprint.
+            let q = vec2<f32>(p) * k;
+            v = (lq_warp(q + vec2<f32>(0.25, 0.25) * k, false) + lq_warp(q + vec2<f32>(0.75, 0.25) * k, false)
+                + lq_warp(q + vec2<f32>(0.25, 0.75) * k, false) + lq_warp(q + vec2<f32>(0.75, 0.75) * k, false)) * 0.25;
+        }
+        if (v.a > 1e-6) { o = vec4<f32>(v.rgb / v.a, min(v.a, 1.0)); } else { o = vec4<f32>(0.0); }
+    } else {
+        let q = p - info.in0.xy;
+        if (info.connected.x != 0u && inside(q, info.in0.zw)) { o = textureLoad(in0, q, 0); }
+    }
+    textureStore(out_tex, out_coord(gid), o);
+}

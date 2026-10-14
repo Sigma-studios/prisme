@@ -27,3 +27,6 @@ serde_json = "1"
 postcard = { workspace = true }
 log = { workspace = true }
 web-time = { workspace = true }
+
+[dev-dependencies]
+pollster = "0.4"

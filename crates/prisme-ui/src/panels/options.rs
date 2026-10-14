@@ -5,7 +5,7 @@ use egui::{ComboBox, DragValue, RichText, Ui};
 use prisme_brush::{presets, BrushSettings, TipShape};
 use prisme_core::gradient::{GradientKind, GradientRepeat};
 use prisme_core::SelectionOp;
-use prisme_tools::ToolKind;
+use prisme_tools::{LiquifyMode, ToolKind};
 
 fn brush_controls(ui: &mut Ui, b: &mut BrushSettings, id: &str) {
     ui.label("Size");
@@ -32,7 +32,18 @@ fn brush_controls(ui: &mut Ui, b: &mut BrushSettings, id: &str) {
     ui.add(egui::Slider::new(&mut b.smoothing, 0.0..=0.95).show_value(false));
 }
 
+/// Liquify session state: (open, can undo, can redo).
+fn liquify_state(s: &mut AppState) -> (bool, bool, bool) {
+    let Some(t) = s.tools.get_mut(&ToolKind::Liquify) else { return (false, false, false) };
+    let any: &mut dyn std::any::Any = t.as_mut();
+    let Some(l) = any.downcast_mut::<prisme_tools::tools::LiquifyTool>() else { return (false, false, false) };
+    let (u, r) = l.can_undo();
+    (l.active(), u, r)
+}
+
 pub fn ui(s: &mut AppState, ui: &mut Ui) {
+    let lq = if s.tool == ToolKind::Liquify { liquify_state(s) } else { (false, false, false) };
+    let mut lq_key = None;
     ui.horizontal(|ui| {
         ui.label(RichText::new(format!("{} {}", crate::app::tool_icon(s.tool), s.tool.name())).strong());
         ui.separator();
@@ -126,6 +137,40 @@ pub fn ui(s: &mut AppState, ui: &mut Ui) {
                         crate::commands::straighten(s, a);
                     }
             }
+            ToolKind::Liquify => {
+                let l = &mut o.liquify;
+                ComboBox::from_id_salt("liquify-mode").selected_text(l.mode.name()).width(150.0).show_ui(ui, |ui| {
+                    for m in LiquifyMode::ALL {
+                        ui.selectable_value(&mut l.mode, m, m.name());
+                    }
+                });
+                ui.label("Size");
+                ui.add(DragValue::new(&mut l.size).range(1.0..=2000.0).speed(0.5).suffix(" px"));
+                ui.label("Pressure");
+                ui.add(egui::Slider::new(&mut l.pressure, 0.01..=1.0).show_value(false));
+                ui.label("Density");
+                ui.add(egui::Slider::new(&mut l.density, 0.0..=1.0).show_value(false)).on_hover_text("Edge falloff: low = soft, high = firm");
+                ui.add_enabled_ui(l.mode.stationary(), |ui| {
+                    ui.label("Rate");
+                    ui.add(egui::Slider::new(&mut l.rate, 0.01..=1.0).show_value(false)).on_hover_text("Speed of bloat, pucker, twirl, smooth and reconstruct (they keep acting while the pointer is held still)");
+                });
+                ui.checkbox(&mut l.show_mask, "Show freeze");
+                ui.separator();
+                let (open, undo, redo) = lq;
+                if ui.add_enabled(undo, egui::Button::new(egui_phosphor::regular::ARROW_COUNTER_CLOCKWISE)).on_hover_text("Undo last liquify stroke").clicked() {
+                    lq_key = Some(prisme_tools::ToolKey::Undo);
+                }
+                if ui.add_enabled(redo, egui::Button::new(egui_phosphor::regular::ARROW_CLOCKWISE)).on_hover_text("Redo liquify stroke").clicked() {
+                    lq_key = Some(prisme_tools::ToolKey::Redo);
+                }
+                if ui.add_enabled(open, egui::Button::new("Apply")).on_hover_text("Bake the deformation (Enter)").clicked() {
+                    lq_key = Some(prisme_tools::ToolKey::Enter);
+                }
+                if ui.add_enabled(open, egui::Button::new("Cancel")).on_hover_text("Discard the deformation (Esc)").clicked() {
+                    lq_key = Some(prisme_tools::ToolKey::Escape);
+                }
+                ui.label(RichText::new("Raster layer pixels only").small().color(crate::theme::TEXT_DIM));
+            }
             ToolKind::Text => {
                 ui.label(RichText::new("Click to add text, click text to edit, drag to move · Esc to finish · style in Properties").small().color(crate::theme::TEXT_DIM));
             }
@@ -150,4 +195,7 @@ pub fn ui(s: &mut AppState, ui: &mut Ui) {
             });
         }
     });
+    if let Some(k) = lq_key {
+        crate::commands::tool_key(s, &k);
+    }
 }
