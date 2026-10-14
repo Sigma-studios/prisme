@@ -194,5 +194,5 @@ pub fn install_quit_guard() {
 
 pub fn request_app_terminate() {
     let Some(mtm) = MainThreadMarker::new() else { return };
-    unsafe { objc2_app_kit::NSApplication::sharedApplication(mtm).terminate(None) };
+    objc2_app_kit::NSApplication::sharedApplication(mtm).terminate(None);
 }
