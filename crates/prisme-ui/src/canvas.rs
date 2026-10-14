@@ -43,10 +43,6 @@ struct DragState {
 
 pub fn canvas_tab(s: &mut AppState, ui: &mut Ui) {
     doc_tabs(s, ui);
-    if s.dialogs.shortcuts.focused {
-        crate::shortcuts::ui(s, ui);
-        return;
-    }
     if s.docs.is_empty() {
         welcome(s, ui);
         return;
@@ -682,15 +678,14 @@ fn draw_overlay(p: &egui::Painter, o: &Overlay, to_s: &dyn Fn([f32; 2]) -> Pos2,
 }
 
 fn doc_tabs(s: &mut AppState, ui: &mut Ui) {
-    if s.docs.is_empty() && !s.dialogs.shortcuts.open {
+    if s.docs.is_empty() {
         return;
     }
     let mut close = None;
-    let mut close_keys = false;
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 2.0;
         for i in 0..s.docs.len() {
-            let selected = i == s.active && !s.dialogs.shortcuts.focused;
+            let selected = i == s.active;
             let title = s.docs[i].title();
             let frame = egui::Frame::new()
                 .fill(if selected { theme::BG2 } else { theme::BG1 })
@@ -703,7 +698,6 @@ fn doc_tabs(s: &mut AppState, ui: &mut Ui) {
                         if let Some(d) = s.doc_mut() {
                             d.cancel_working();
                         }
-                        crate::shortcuts::unfocus(s);
                         s.active = i;
                     }
                 if ui.add(egui::Button::new(egui_phosphor::regular::X).frame(false).small()).clicked() {
@@ -711,30 +705,9 @@ fn doc_tabs(s: &mut AppState, ui: &mut Ui) {
                 }
             });
         }
-        // Non-document tab.
-        if s.dialogs.shortcuts.open {
-            let selected = s.dialogs.shortcuts.focused;
-            let frame = egui::Frame::new()
-                .fill(if selected { theme::BG2 } else { theme::BG1 })
-                .corner_radius(egui::CornerRadius { nw: 5, ne: 5, sw: 0, se: 0 })
-                .inner_margin(egui::Margin::symmetric(8, 3));
-            frame.show(ui, |ui| {
-                let title = format!("{} {}", egui_phosphor::regular::KEYBOARD, crate::shortcuts::TITLE);
-                if ui.add(egui::Label::new(egui::RichText::new(title).color(if selected { theme::TEXT } else { theme::TEXT_DIM })).sense(Sense::click())).clicked()
-                    && !selected {
-                        crate::shortcuts::open(s);
-                    }
-                if ui.add(egui::Button::new(egui_phosphor::regular::X).frame(false).small()).clicked() {
-                    close_keys = true;
-                }
-            });
-        }
     });
     if let Some(i) = close {
         crate::commands::close_doc(s, i);
-    }
-    if close_keys {
-        crate::shortcuts::close(s);
     }
 }
 

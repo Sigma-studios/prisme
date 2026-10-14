@@ -1,4 +1,4 @@
-//! Keyboard Shortcuts editor: a non-document tab in the canvas tab strip.
+//! Keyboard Shortcuts editor: its own dock tab, opened beside the Canvas tab.
 
 use crate::actions::{shortcut_matches, Action, Binding, Keymap};
 use crate::app::AppState;
@@ -10,15 +10,17 @@ pub const TITLE: &str = "Keyboard Shortcuts";
 
 #[derive(Default)]
 pub struct ShortcutsTab {
-    /// Tab present in the document strip.
-    pub open: bool,
-    /// Tab is the active one (then there is no active document: `AppState::doc()` is None).
+    /// Pending dock change: Some(true) = add/show the tab, Some(false) = remove it.
+    pub request: Option<bool>,
+    /// The tab is showing (active in its dock leaf); set by the app each frame.
     pub focused: bool,
+    /// The tab is in the dock leaf that has focus (Cmd+W closes it).
+    pub dock_focused: bool,
     pub search: String,
     pub rebinding: Option<Action>,
     /// Captured binding awaiting Replace/Cancel: (target, binding, current holder).
     pub conflict: Option<(Action, Binding, Action)>,
-    /// Bring the Canvas dock tab forward on the next frame.
+    /// Bring the Canvas dock tab forward on the next frame (a document was opened/selected).
     pub reveal: bool,
     focus_search: bool,
 }
@@ -29,22 +31,23 @@ pub fn open(s: &mut AppState) {
         d.cancel_working();
     }
     let st = &mut s.dialogs.shortcuts;
-    st.open = true;
-    st.focused = true;
-    st.reveal = true;
+    st.request = Some(true);
     st.focus_search = true;
 }
 
 pub fn close(s: &mut AppState) {
-    let st = &mut s.dialogs.shortcuts;
-    st.open = false;
-    unfocus(s);
+    s.dialogs.shortcuts.request = Some(false);
+    stop_editing(s);
 }
 
-/// Another (document) tab became active.
+/// A document was opened or selected: show the Canvas tab.
 pub fn unfocus(s: &mut AppState) {
+    s.dialogs.shortcuts.reveal = true;
+}
+
+/// Drop an in-progress rebind / conflict prompt (tab hidden or closed).
+pub fn stop_editing(s: &mut AppState) {
     let st = &mut s.dialogs.shortcuts;
-    st.focused = false;
     st.rebinding = None;
     st.conflict = None;
 }

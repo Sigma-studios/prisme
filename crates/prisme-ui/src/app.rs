@@ -27,6 +27,7 @@ pub enum Tab {
     Scopes,
     Brushes,
     Navigator,
+    Shortcuts,
 }
 
 impl Tab {
@@ -45,6 +46,7 @@ impl Tab {
             Tab::Scopes => "Scopes",
             Tab::Brushes => "Brushes",
             Tab::Navigator => "Navigator",
+            Tab::Shortcuts => "Keyboard Shortcuts",
         }
     }
 }
@@ -215,18 +217,11 @@ fn install_display_profile(renderer: &mut DisplayRenderer, rs: &egui_wgpu::Rende
 }
 
 impl AppState {
-    /// The active document; None while a non-document tab (Keyboard Shortcuts) is focused.
     pub fn doc(&self) -> Option<&DocState> {
-        if self.dialogs.shortcuts.focused {
-            return None;
-        }
         self.docs.get(self.active)
     }
 
     pub fn doc_mut(&mut self) -> Option<&mut DocState> {
-        if self.dialogs.shortcuts.focused {
-            return None;
-        }
         self.docs.get_mut(self.active)
     }
 
@@ -298,7 +293,10 @@ impl TabViewer for Viewer<'_> {
     type Tab = Tab;
 
     fn title(&mut self, tab: &mut Tab) -> egui::WidgetText {
-        tab.title().into()
+        match tab {
+            Tab::Shortcuts => format!("{} {}", egui_phosphor::regular::KEYBOARD, tab.title()).into(),
+            _ => tab.title().into(),
+        }
     }
 
     fn id(&mut self, tab: &mut Tab) -> egui::Id {
@@ -317,6 +315,7 @@ impl TabViewer for Viewer<'_> {
             Tab::Scopes => crate::panels::scopes::ui(self.s, ui),
             Tab::Brushes => crate::panels::brushes::ui(self.s, ui),
             Tab::Navigator => crate::panels::navigator::ui(self.s, ui),
+            Tab::Shortcuts => crate::shortcuts::ui(self.s, ui),
         }
     }
 
@@ -326,7 +325,7 @@ impl TabViewer for Viewer<'_> {
 
     fn scroll_bars(&self, tab: &Tab) -> [bool; 2] {
         match tab {
-            Tab::Canvas | Tab::Nodes => [false, false],
+            Tab::Canvas | Tab::Nodes | Tab::Shortcuts => [false, false],
             _ => [false, true],
         }
     }
@@ -391,10 +390,38 @@ impl eframe::App for PrismeApp {
         egui::Panel::bottom("status").exact_size(22.0).show(ui, |ui| status_bar(s, ui));
         egui::Panel::left("toolbar").exact_size(44.0).resizable(false).show(ui, |ui| toolbar(s, ui));
 
+        match s.dialogs.shortcuts.request.take() {
+            // Show the shortcuts tab, adding it next to Canvas if it isn't open.
+            Some(true) => match (self.dock.find_tab(&Tab::Shortcuts), self.dock.find_tab(&Tab::Canvas)) {
+                (Some(p), _) => {
+                    let _ = self.dock.set_active_tab(p);
+                }
+                (None, Some(c)) => match self.dock.leaf_mut(egui_dock::NodePath { surface: c.surface, node: c.node }) {
+                    Ok(leaf) => leaf.append_tab(Tab::Shortcuts),
+                    Err(_) => self.dock.push_to_focused_leaf(Tab::Shortcuts),
+                },
+                (None, None) => self.dock.push_to_focused_leaf(Tab::Shortcuts),
+            },
+            Some(false) => {
+                if let Some(p) = self.dock.find_tab(&Tab::Shortcuts) {
+                    self.dock.remove_tab(p);
+                }
+            }
+            None => {}
+        }
         if std::mem::take(&mut s.dialogs.shortcuts.reveal)
             && let Some(loc) = self.dock.find_tab(&Tab::Canvas) {
                 let _ = self.dock.set_active_tab(loc);
             }
+        // Visible = active tab of its leaf; a hidden or closed tab stops any rebind in progress.
+        let visible = self.dock.find_tab(&Tab::Shortcuts).is_some_and(|p| {
+            self.dock.leaf(egui_dock::NodePath { surface: p.surface, node: p.node }).is_ok_and(|l| l.active == p.tab)
+        });
+        s.dialogs.shortcuts.focused = visible;
+        s.dialogs.shortcuts.dock_focused = matches!(self.dock.find_active_focused(), Some((_, Tab::Shortcuts)));
+        if !visible {
+            crate::shortcuts::stop_editing(s);
+        }
         egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
             let mut style = Style::from_egui(ui.style().as_ref());
             style.tab_bar.bg_fill = theme::BG0;

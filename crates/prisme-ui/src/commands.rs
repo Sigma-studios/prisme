@@ -149,7 +149,7 @@ pub fn run_action(s: &mut AppState, a: Action, ctx: &egui::Context) {
         Action::SaveAs => crate::jobs::save(s, true),
         Action::Export => crate::dialogs::open_export(s, false),
         Action::ExportSelection => crate::dialogs::open_export(s, true),
-        Action::Close if s.dialogs.shortcuts.focused => crate::shortcuts::close(s),
+        Action::Close if s.dialogs.shortcuts.dock_focused => crate::shortcuts::close(s),
         Action::Close => {
             let i = s.active;
             close_doc(s, i)
