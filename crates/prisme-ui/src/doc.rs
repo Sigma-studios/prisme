@@ -78,6 +78,9 @@ pub struct DocState {
     pub working: Option<Document>,
     pub view: View,
     pub path: Option<std::path::PathBuf>,
+    /// The blank document created at launch: replaced by the first document opened or
+    /// created while it's still untouched.
+    pub blank_startup: bool,
     pub saved_revision: u64,
     /// Bumped on every visible change (render cache key).
     pub version: u64,
@@ -111,6 +114,7 @@ impl DocState {
             view: View::default(),
             path: None,
             saved_revision: rev,
+            blank_startup: false,
             version: 1,
             render: RenderCache::default(),
             show_nodes: true,

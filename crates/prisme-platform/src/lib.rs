@@ -92,6 +92,22 @@ mod fallback {
 // ---------------------------------------------------------------------------------------------
 // Screen colour picking
 
+/// The screen's size in physical pixels where only the platform knows it (web). Native
+/// windows get it from egui (`ViewportInfo::monitor_size`).
+pub fn screen_size_px() -> Option<[u32; 2]> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let w = web_sys::window()?;
+        let s = w.screen().ok()?;
+        let r = w.device_pixel_ratio();
+        Some([(s.width().ok()? as f64 * r).round() as u32, (s.height().ok()? as f64 * r).round() as u32])
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        None
+    }
+}
+
 /// Whether [`pick_screen_color`] can work on this platform / browser.
 pub fn screen_picker_supported() -> bool {
     #[cfg(any(target_os = "macos", windows))]

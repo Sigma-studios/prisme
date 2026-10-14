@@ -86,6 +86,8 @@ pub struct AppState {
     pub start_time: f64,
     pub frame_ms: f32,
     pub space_pan: bool,
+    /// Frames spent waiting to create the launch document (None once settled).
+    pub startup_frames: Option<u32>,
 }
 
 pub struct PrismeApp {
@@ -193,6 +195,7 @@ impl PrismeApp {
             start_time: now,
             frame_ms: 0.0,
             space_pan: false,
+            startup_frames: Some(0),
         };
         s.install_text_bounds();
         crate::jobs::check_recovery(&mut s);
@@ -231,6 +234,11 @@ impl AppState {
 
     pub fn add_doc(&mut self, d: DocState) {
         crate::shortcuts::unfocus(self);
+        self.startup_frames = None;
+        // The blank launch document gives way to the first real one.
+        if let Some(i) = self.docs.iter().position(|d| d.blank_startup && !d.is_dirty() && d.path.is_none()) {
+            crate::commands::close_doc(self, i);
+        }
         self.docs.push(d);
         self.active = self.docs.len() - 1;
     }
@@ -341,6 +349,7 @@ impl eframe::App for PrismeApp {
         let s = &mut self.s;
         crate::jobs::poll(s, &ctx);
         crate::stroke::poll(s, &ctx);
+        startup_doc(s, &ctx);
         if let Some(sc) = &mut self.script {
             crate::script::step(s, sc, &ctx);
         }
@@ -466,13 +475,48 @@ impl PrismeApp {
     }
 }
 
+/// Opened with nothing to show (no file, nothing to recover): start a blank document the
+/// size of the screen, framed by the canvas's fit on first show.
+fn startup_doc(s: &mut AppState, ctx: &egui::Context) {
+    let Some(frames) = s.startup_frames else { return };
+    // Files from the command line decode as jobs; a recovery prompt decides for itself.
+    if !s.docs.is_empty() {
+        s.startup_frames = None;
+        return;
+    }
+    if !s.jobs.is_empty() || !s.dialogs.recovery.is_empty() {
+        return;
+    }
+    let native = ctx.input(|i| {
+        let v = i.viewport();
+        v.monitor_size.map(|m| m * v.native_pixels_per_point.unwrap_or(i.pixels_per_point))
+    });
+    let size = native.map(|m| [m.x.round() as u32, m.y.round() as u32]).or_else(prisme_platform::screen_size_px).filter(|s| s[0] > 0 && s[1] > 0);
+    // The monitor can take a frame or two to be known.
+    let size = match size {
+        Some(sz) => sz,
+        None if frames < 10 => {
+            s.startup_frames = Some(frames + 1);
+            ctx.request_repaint();
+            return;
+        }
+        None => [1920, 1080],
+    };
+    let nd = crate::dialogs::NewDoc::default();
+    let mut d = DocState::new(prisme_core::Document::with_background(nd.name, size[0], size[1], Some([1.0; 4])));
+    d.blank_startup = true;
+    s.add_doc(d);
+}
+
 fn handle_dropped_files(s: &mut AppState, ctx: &egui::Context) {
     let files = ctx.input(|i| i.raw.dropped_files.clone());
     for f in files {
         let path = f.path().to_path_buf();
         let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "dropped".into());
         // Dropping onto an open document places it as a layer (hold Shift to open separately).
-        let place = !s.docs.is_empty() && !ctx.input(|i| i.modifiers.shift) && !prisme_io::is_project_file(&name);
+        // The untouched launch document isn't a target: the file replaces it.
+        let blank = s.doc().is_some_and(|d| d.blank_startup && !d.is_dirty());
+        let place = !s.docs.is_empty() && !blank && !ctx.input(|i| i.modifiers.shift) && !prisme_io::is_project_file(&name);
         let into = if place { s.doc().map(|d| d.id) } else { None };
         let p = (!path.as_os_str().is_empty()).then_some(path);
         #[cfg(not(target_arch = "wasm32"))]
