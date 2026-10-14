@@ -16,9 +16,12 @@ pub struct NewDoc {
     pub name: String,
     pub fill: u8, // 0 white, 1 black, 2 transparent, 3 background colour
     pub f32: bool,
-    /// Infinite canvas (no page; the size is only the initial frame).
+    /// Canvas mode chosen at the top of the dialog: infinite has no page, so no size fields.
     pub infinite: bool,
 }
+
+/// Hidden starting frame of an infinite canvas (initial view; centre for Vignette / Transform).
+const INFINITE_FRAME: (u32, u32) = (1920, 1080);
 
 impl Default for NewDoc {
     fn default() -> Self {
@@ -115,38 +118,60 @@ fn new_doc(s: &mut AppState, ctx: &egui::Context) {
     let mut create = false;
     Window::new("New Image").open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
         let nd = &mut s.dialogs.new_doc;
-        ui.horizontal(|ui| {
+        // Mode first: it decides which fields exist below.
+        egui::Grid::new("new-doc").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+            ui.label("Canvas");
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                ui.selectable_value(&mut nd.infinite, false, format!("{} Fixed size", egui_phosphor::regular::FRAME_CORNERS));
+                ui.selectable_value(&mut nd.infinite, true, format!("{} Infinite", egui_phosphor::regular::INFINITY));
+            });
+            ui.end_row();
             ui.label("Name");
             ui.text_edit_singleline(&mut nd.name);
-        });
-        ui.horizontal(|ui| {
-            ui.label("Size");
-            ui.add(DragValue::new(&mut nd.w).range(1..=65535).suffix(" px"));
-            ui.label("×");
-            ui.add(DragValue::new(&mut nd.h).range(1..=65535).suffix(" px"));
-        });
-        ui.horizontal_wrapped(|ui| {
-            for (n, w, h) in [("HD", 1920, 1080), ("4K", 3840, 2160), ("Square", 2048, 2048), ("A4 300dpi", 2480, 3508), ("Instagram", 1080, 1350), ("Icon", 512, 512)] {
-                if ui.small_button(n).clicked() {
-                    nd.w = w;
-                    nd.h = h;
-                }
+            ui.end_row();
+            if nd.infinite {
+                ui.label("");
+                ui.label(RichText::new("No page: paint anywhere.\nExport Selection exports a region; Export exports everything you painted.").small().color(theme::TEXT_DIM));
+                ui.end_row();
+            } else {
+                ui.label("Size");
+                ui.horizontal(|ui| {
+                    ui.add(DragValue::new(&mut nd.w).range(1..=65535).suffix(" px"));
+                    ui.label("×");
+                    ui.add(DragValue::new(&mut nd.h).range(1..=65535).suffix(" px"));
+                });
+                ui.end_row();
+                ui.label("");
+                ui.horizontal_wrapped(|ui| {
+                    ui.set_max_width(420.0);
+                    for (n, w, h) in [("HD", 1920, 1080), ("4K", 3840, 2160), ("Square", 2048, 2048), ("A4 300dpi", 2480, 3508), ("Instagram", 1080, 1350), ("Icon", 512, 512)] {
+                        if ui.selectable_label(nd.w == w && nd.h == h, n).clicked() {
+                            nd.w = w;
+                            nd.h = h;
+                        }
+                    }
+                });
+                ui.end_row();
             }
-        });
-        ui.horizontal(|ui| {
             ui.label("Background");
-            for (i, n) in ["White", "Black", "Transparent", "BG colour"].iter().enumerate() {
-                ui.selectable_value(&mut nd.fill, i as u8, *n);
+            ui.horizontal(|ui| {
+                for (i, n) in ["White", "Black", "Transparent", "BG colour"].iter().enumerate() {
+                    ui.selectable_value(&mut nd.fill, i as u8, *n);
+                }
+            });
+            ui.end_row();
+            ui.label("");
+            ui.checkbox(&mut nd.f32, "32-bit float storage (HDR / heavy grading)");
+            ui.end_row();
+        });
+        ui.add_space(6.0);
+        // Fixed-height row: a bare right_to_left layout would take all remaining height.
+        ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), 24.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.button(RichText::new("Create").strong()).clicked() {
+                create = true;
             }
         });
-        ui.checkbox(&mut nd.f32, "32-bit float storage (HDR / heavy grading)");
-        ui.checkbox(&mut nd.infinite, "Infinite canvas").on_hover_text(
-            "No page: paint anywhere. The size above is only the initial view. Export Selection exports a region; Export exports the content bounds.",
-        );
-        ui.add_space(6.0);
-        if ui.button("Create").clicked() {
-            create = true;
-        }
     });
     if create {
         let nd = &s.dialogs.new_doc;
@@ -156,7 +181,7 @@ fn new_doc(s: &mut AppState, ctx: &egui::Context) {
             2 => None,
             _ => Some(s.settings.bg),
         };
-        let mut d = if nd.infinite { Document::infinite(nd.name.clone(), nd.w, nd.h, fill) } else { Document::with_background(nd.name.clone(), nd.w, nd.h, fill) };
+        let mut d = if nd.infinite { Document::infinite(nd.name.clone(), INFINITE_FRAME.0, INFINITE_FRAME.1, fill) } else { Document::with_background(nd.name.clone(), nd.w, nd.h, fill) };
         if nd.f32 {
             d.info.format = prisme_core::PixelFormat::F32;
             for l in &mut d.layers {

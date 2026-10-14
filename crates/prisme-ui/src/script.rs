@@ -286,6 +286,10 @@ pub fn step(s: &mut AppState, sc: &mut Script, ctx: &egui::Context) {
         }
         "hdr-status" => log::info!("script: hdr-status {:?} (mode {:?}, highlights {:?})", s.hdr, s.settings.hdr_mode, s.settings.hdr_highlights),
         "shortcuts" => crate::shortcuts::open(s),
+        "new-dialog" => {
+            s.dialogs.new_doc.open = true;
+            s.dialogs.new_doc.infinite = arg == "infinite";
+        }
         "terminate" => prisme_platform::request_app_terminate(),
         "quit" => {
             s.dialogs.allow_quit = true;
