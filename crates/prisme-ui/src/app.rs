@@ -326,6 +326,7 @@ impl eframe::App for PrismeApp {
         let ctx = ui.ctx().clone();
         let s = &mut self.s;
         crate::jobs::poll(s, &ctx);
+        crate::stroke::poll(s, &ctx);
         if let Some(sc) = &mut self.script {
             crate::script::step(s, sc, &ctx);
         }

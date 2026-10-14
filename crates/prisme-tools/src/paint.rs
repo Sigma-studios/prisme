@@ -64,15 +64,10 @@ pub fn draw_gradient(grid: &mut TileGrid, bounds: IRect, g: &Gradient, geo: &Gra
     });
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum RetouchMode {
-    Smudge { strength: f32 },
-    Blur { strength: f32 },
-    Clone { offset: [f32; 2] },
-    Heal { offset: [f32; 2] },
-}
+pub use prisme_brush::RetouchMode;
 
-/// Per-dab retouching that reads pixels (smudge, blur, clone, heal).
+/// Per-dab retouching that reads pixels (smudge, blur, clone, heal). CPU reference path;
+/// interactive strokes run on the GPU (`prisme_gpu::stroke`).
 pub struct RetouchCanvas {
     pub mode: RetouchMode,
     /// Snapshot of the layer at stroke start (clone/heal source; avoids feedback).

@@ -5,6 +5,9 @@
 //! and dynamics. Dabs accumulate into a per-stroke coverage buffer which is then
 //! composited onto a snapshot of the layer taken at stroke start; this gives correct
 //! "opacity caps the stroke, flow builds up" behaviour and lets erase/paint share code.
+//! Dynamics and dab placement always run here on the CPU; rasterizing/accumulating dabs
+//! and compositing run on the GPU in the app (`prisme_gpu::stroke`), with [`StrokeCanvas`]
+//! as the CPU reference/fallback.
 //!
 //! Tablet support only needs a new event source: dynamics already map from abstract
 //! inputs (pressure, tilt, velocity, direction, random).
@@ -15,7 +18,7 @@ pub mod stroke;
 
 pub use dab::{Dab, TipShape};
 pub use presets::{presets, BrushPreset};
-pub use stroke::{BlendTarget, Stroke, StrokeCanvas};
+pub use stroke::{BlendTarget, RetouchMode, Stroke, StrokeCanvas, StrokeMode};
 
 use serde::{Deserialize, Serialize};
 

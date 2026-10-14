@@ -28,8 +28,13 @@ pub fn ui(s: &mut AppState, ui: &mut Ui) {
         }
     });
     if let Some(i) = jump {
-        d.working = None;
-        d.history.jump(i);
+        // Landing a pending stroke truncates redo entries: then only earlier states stay valid.
+        let cursor = d.history.cursor();
+        d.finish_stroke();
+        if i <= cursor || d.history.cursor() == cursor {
+            d.working = None;
+            d.history.jump(i);
+        }
         d.touch();
     }
 }

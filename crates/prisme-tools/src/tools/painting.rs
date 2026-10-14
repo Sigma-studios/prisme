@@ -2,20 +2,12 @@ use super::*;
 use crate::input::{Phase, PointerKind};
 use crate::paint::{draw_gradient, fill_region, RetouchCanvas, RetouchMode};
 use crate::region::{flood, Sample};
-use prisme_brush::{BlendTarget, BrushSettings, InputSample, Stroke, StrokeCanvas};
+use crate::stroke::{target_grid, PaintTarget, StrokeOp, StrokeSpec};
+use prisme_brush::{BlendTarget, BrushSettings, Dab, InputSample, Stroke, StrokeCanvas, StrokeMode};
 use prisme_core::gradient::GradientGeometry;
 use prisme_core::layer::{FillContent, FillLayer, Layer, LayerKind, LayerMask};
 use prisme_core::TileGrid;
 use std::sync::Arc;
-
-/// Where painting goes: the active layer's pixels or its mask.
-#[derive(Clone, Copy)]
-struct PaintTarget {
-    layer: LayerId,
-    mask: bool,
-    /// Painting on a saved (document-level) mask instead of a layer.
-    saved: Option<prisme_core::MaskId>,
-}
 
 fn resolve_target(cx: &mut ToolCx) -> Result<PaintTarget, String> {
     if let Some(mid) = cx.opts.edit_saved_mask {
@@ -40,18 +32,6 @@ fn resolve_target(cx: &mut ToolCx) -> Result<PaintTarget, String> {
     }
 }
 
-fn target_grid(doc: &mut Document, t: PaintTarget) -> Option<&mut TileGrid> {
-    if let Some(mid) = t.saved {
-        return doc.masks.iter_mut().find(|m| m.id == mid).map(|m| Arc::make_mut(&mut m.mask));
-    }
-    let l = doc.layer_mut(t.layer)?;
-    if t.mask {
-        l.mask.as_mut().map(|m| Arc::make_mut(&mut m.grid))
-    } else {
-        l.raster_mut()
-    }
-}
-
 fn target_arc(doc: &Document, t: PaintTarget) -> Option<(Arc<TileGrid>, f32, bool)> {
     if let Some(mid) = t.saved {
         return doc.saved_mask(mid).map(|m| (m.mask.clone(), 0.0, false));
@@ -68,10 +48,83 @@ fn sample_of(ev: &ToolInput) -> InputSample {
     InputSample { pos: ev.pos, pressure: ev.pressure, tilt: ev.tilt, tilt_dir: ev.tilt_dir, time: ev.time }
 }
 
+/// Where a stroke's dabs go: the host's GPU stroke buffer, or the CPU canvases (no GPU host).
+enum Backend {
+    Gpu,
+    Paint(StrokeCanvas),
+    Retouch(RetouchCanvas),
+}
+
+/// An in-progress dab stroke.
+struct DabStroke {
+    stroke: Stroke,
+    backend: Backend,
+    target: PaintTarget,
+}
+
+impl DabStroke {
+    fn begin(cx: &mut ToolCx, stroke: Stroke, spec: StrokeSpec) -> Self {
+        let target = spec.target;
+        let backend = match (cx.strokes.as_deref_mut(), spec.mode) {
+            (Some(ops), _) => {
+                ops.push(StrokeOp::Begin(spec));
+                Backend::Gpu
+            }
+            (None, StrokeMode::Paint { target, opacity, lock_alpha }) => {
+                Backend::Paint(StrokeCanvas::new(spec.base, target, opacity, spec.selection, lock_alpha, spec.base_default))
+            }
+            (None, StrokeMode::Retouch(m)) => Backend::Retouch(RetouchCanvas::new(m, spec.base, spec.selection)),
+        };
+        Self { stroke, backend, target }
+    }
+
+    fn apply(&mut self, cx: &mut ToolCx, dabs: Vec<Dab>) {
+        if dabs.is_empty() {
+            return;
+        }
+        match &mut self.backend {
+            Backend::Gpu => {
+                if let Some(ops) = cx.strokes.as_deref_mut() {
+                    ops.push(StrokeOp::Dabs(dabs));
+                }
+            }
+            Backend::Paint(c) => {
+                if let Some(g) = target_grid(cx.doc, self.target) {
+                    c.apply(&dabs, g);
+                }
+            }
+            Backend::Retouch(c) => {
+                if let Some(g) = target_grid(cx.doc, self.target) {
+                    c.apply(&dabs, g);
+                }
+            }
+        }
+    }
+
+    /// GPU strokes commit when the host lands the readback; CPU strokes commit now.
+    fn end(self, cx: &mut ToolCx, label: &str) -> ToolOutcome {
+        match self.backend {
+            Backend::Gpu => {
+                if let Some(ops) = cx.strokes.as_deref_mut() {
+                    ops.push(StrokeOp::End(label.into()));
+                }
+                ToolOutcome::Preview
+            }
+            Backend::Paint(c) => {
+                if let Some(g) = target_grid(cx.doc, self.target) {
+                    c.finish(g);
+                }
+                ToolOutcome::Commit(label.into())
+            }
+            Backend::Retouch(_) => ToolOutcome::Commit(label.into()),
+        }
+    }
+}
+
 /// Paint brush and eraser.
 pub struct BrushTool {
     erase: bool,
-    stroke: Option<(Stroke, StrokeCanvas, PaintTarget)>,
+    stroke: Option<DabStroke>,
     last_end: Option<[f32; 2]>,
     hover: Option<[f32; 2]>,
     size: f32,
@@ -115,7 +168,8 @@ impl Tool for BrushTool {
                 } else {
                     BlendTarget::Color(cx.fg)
                 };
-                let canvas = StrokeCanvas::new(base, blend, settings.opacity, cx.doc.selection.clone(), lock_alpha, default);
+                let mode = StrokeMode::Paint { target: blend, opacity: settings.opacity, lock_alpha };
+                let spec = StrokeSpec { target, base, base_default: default, selection: cx.doc.selection.clone(), mode };
                 let mut stroke = Stroke::new(settings, (ev.time * 1000.0) as u64 + 1);
                 let mut dabs = vec![];
                 // Shift-click: straight line from the end of the previous stroke.
@@ -123,47 +177,38 @@ impl Tool for BrushTool {
                     dabs.extend(stroke.add(InputSample { pos: prev, ..sample_of(ev) }));
                 }
                 dabs.extend(stroke.add(sample_of(ev)));
-                self.stroke = Some((stroke, canvas, target));
-                let (_, canvas, target) = self.stroke.as_mut().unwrap();
-                if let Some(g) = target_grid(cx.doc, *target) {
-                    canvas.apply(&dabs, g);
-                }
+                let mut s = DabStroke::begin(cx, stroke, spec);
+                s.apply(cx, dabs);
+                self.stroke = Some(s);
                 ToolOutcome::Preview
             }
             Phase::Move => {
-                let Some((stroke, canvas, target)) = self.stroke.as_mut() else { return ToolOutcome::None };
-                let dabs = stroke.add(sample_of(ev));
+                let Some(s) = self.stroke.as_mut() else { return ToolOutcome::None };
+                let dabs = s.stroke.add(sample_of(ev));
                 if dabs.is_empty() {
                     return ToolOutcome::None;
                 }
-                if let Some(g) = target_grid(cx.doc, *target) {
-                    canvas.apply(&dabs, g);
-                }
+                s.apply(cx, dabs);
                 ToolOutcome::Preview
             }
             Phase::Up => {
-                let Some((mut stroke, mut canvas, target)) = self.stroke.take() else { return ToolOutcome::None };
-                let dabs = stroke.add(sample_of(ev));
-                if let Some(g) = target_grid(cx.doc, target) {
-                    canvas.apply(&dabs, g);
-                    canvas.finish(g);
-                }
+                let Some(mut s) = self.stroke.take() else { return ToolOutcome::None };
+                let dabs = s.stroke.add(sample_of(ev));
+                s.apply(cx, dabs);
                 self.last_end = Some(ev.pos);
-                ToolOutcome::Commit(if self.erase { "Erase" } else { "Brush Stroke" }.into())
+                s.end(cx, if self.erase { "Erase" } else { "Brush Stroke" })
             }
             Phase::Hover => ToolOutcome::None,
         }
     }
 
     fn tick(&mut self, cx: &mut ToolCx, time: f64) -> ToolOutcome {
-        let Some((stroke, canvas, target)) = self.stroke.as_mut() else { return ToolOutcome::None };
-        let dabs = stroke.tick(time);
+        let Some(s) = self.stroke.as_mut() else { return ToolOutcome::None };
+        let dabs = s.stroke.tick(time);
         if dabs.is_empty() {
             return ToolOutcome::None;
         }
-        if let Some(g) = target_grid(cx.doc, *target) {
-            canvas.apply(&dabs, g);
-        }
+        s.apply(cx, dabs);
         ToolOutcome::Preview
     }
 
@@ -185,7 +230,7 @@ pub struct CloneTool {
     heal: bool,
     source: Option<[f32; 2]>,
     offset: Option<[f32; 2]>,
-    stroke: Option<(Stroke, RetouchCanvas, PaintTarget)>,
+    stroke: Option<DabStroke>,
     hover: [f32; 2],
 }
 
@@ -224,30 +269,26 @@ impl Tool for CloneTool {
                 self.offset = Some(offset);
                 let Some((base, _, _)) = target_arc(cx.doc, target) else { return ToolOutcome::None };
                 let mode = if self.heal { RetouchMode::Heal { offset } } else { RetouchMode::Clone { offset } };
-                let canvas = RetouchCanvas::new(mode, base, cx.doc.selection.clone());
+                let spec = StrokeSpec { target, base, base_default: 0.0, selection: cx.doc.selection.clone(), mode: StrokeMode::Retouch(mode) };
                 let mut stroke = Stroke::new(cx.opts.clone_brush.clone(), 7);
                 let dabs = stroke.add(sample_of(ev));
-                self.stroke = Some((stroke, canvas, target));
-                let (_, canvas, target) = self.stroke.as_mut().unwrap();
-                if let Some(g) = target_grid(cx.doc, *target) {
-                    canvas.apply(&dabs, g);
-                }
+                let mut s = DabStroke::begin(cx, stroke, spec);
+                s.apply(cx, dabs);
+                self.stroke = Some(s);
                 ToolOutcome::Preview
             }
             Phase::Move => {
-                let Some((stroke, canvas, target)) = self.stroke.as_mut() else { return ToolOutcome::Preview };
-                let dabs = stroke.add(sample_of(ev));
-                if let Some(g) = target_grid(cx.doc, *target) {
-                    canvas.apply(&dabs, g);
-                }
+                let Some(s) = self.stroke.as_mut() else { return ToolOutcome::Preview };
+                let dabs = s.stroke.add(sample_of(ev));
+                s.apply(cx, dabs);
                 ToolOutcome::Preview
             }
             Phase::Up => {
-                if self.stroke.take().is_some() {
+                if let Some(s) = self.stroke.take() {
                     if !cx.opts.clone_aligned {
                         self.offset = None;
                     }
-                    return ToolOutcome::Commit(if self.heal { "Heal" } else { "Clone Stamp" }.into());
+                    return s.end(cx, if self.heal { "Heal" } else { "Clone Stamp" });
                 }
                 ToolOutcome::None
             }
@@ -282,7 +323,7 @@ impl Tool for CloneTool {
 /// Smudge and blur brushes.
 pub struct RetouchTool {
     blur: bool,
-    stroke: Option<(Stroke, RetouchCanvas, PaintTarget)>,
+    stroke: Option<DabStroke>,
 }
 
 impl RetouchTool {
@@ -307,27 +348,23 @@ impl Tool for RetouchTool {
                 let Some((base, _, _)) = target_arc(cx.doc, target) else { return ToolOutcome::None };
                 let strength = (cx.opts.retouch_strength * ev.pressure.max(0.05)).clamp(0.0, 1.0);
                 let mode = if self.blur { RetouchMode::Blur { strength } } else { RetouchMode::Smudge { strength } };
-                let canvas = RetouchCanvas::new(mode, base, cx.doc.selection.clone());
+                let spec = StrokeSpec { target, base, base_default: 0.0, selection: cx.doc.selection.clone(), mode: StrokeMode::Retouch(mode) };
                 let mut stroke = Stroke::new(cx.opts.retouch_brush.clone(), 3);
                 let dabs = stroke.add(sample_of(ev));
-                self.stroke = Some((stroke, canvas, target));
-                let (_, canvas, target) = self.stroke.as_mut().unwrap();
-                if let Some(g) = target_grid(cx.doc, *target) {
-                    canvas.apply(&dabs, g);
-                }
+                let mut s = DabStroke::begin(cx, stroke, spec);
+                s.apply(cx, dabs);
+                self.stroke = Some(s);
                 ToolOutcome::Preview
             }
             Phase::Move => {
-                let Some((stroke, canvas, target)) = self.stroke.as_mut() else { return ToolOutcome::None };
-                let dabs = stroke.add(sample_of(ev));
-                if let Some(g) = target_grid(cx.doc, *target) {
-                    canvas.apply(&dabs, g);
-                }
+                let Some(s) = self.stroke.as_mut() else { return ToolOutcome::None };
+                let dabs = s.stroke.add(sample_of(ev));
+                s.apply(cx, dabs);
                 ToolOutcome::Preview
             }
             Phase::Up => {
-                if self.stroke.take().is_some() {
-                    return ToolOutcome::Commit(if self.blur { "Blur" } else { "Smudge" }.into());
+                if let Some(s) = self.stroke.take() {
+                    return s.end(cx, if self.blur { "Blur" } else { "Smudge" });
                 }
                 ToolOutcome::None
             }

@@ -10,6 +10,7 @@ use crate::context::GpuContext;
 use crate::image::{GpuImage, TexturePool};
 use crate::kernels::{Globals, Kernels, OutFormat};
 use crate::levels::MipCache;
+use crate::stroke::GpuStroke;
 use crate::upload::{UploadCache, UploadKey};
 use prisme_core::graph::{Node, ParamValue};
 use prisme_core::layer::{FillContent, Layer, LayerKind};
@@ -69,7 +70,7 @@ struct CachedResult {
 pub struct Engine {
     pub ctx: GpuContext,
     pub kernels: Kernels,
-    pool: TexturePool,
+    pub(crate) pool: TexturePool,
     uploads: UploadCache,
     mips: MipCache,
     rasters: HashMap<(LayerId, u32), (u64, Arc<TileGrid>)>,
@@ -115,6 +116,8 @@ struct Frame<'a> {
     layer_hashes: HashMap<LayerId, u64>,
     node_hashes: HashMap<NodeId, u64>,
     stats: EvalStats,
+    /// In-progress (or not yet landed) brush stroke replacing one upload.
+    stroke: Option<&'a GpuStroke>,
 }
 
 impl Engine {
@@ -144,6 +147,11 @@ impl Engine {
     }
 
     pub fn evaluate(&mut self, req: &EvalRequest) -> Option<GpuImage> {
+        self.evaluate_with(req, None)
+    }
+
+    /// Evaluate with a GPU brush stroke spliced into its target (layer pixels or mask).
+    pub fn evaluate_with(&mut self, req: &EvalRequest, stroke: Option<&GpuStroke>) -> Option<GpuImage> {
         if req.rect.is_empty() {
             return None;
         }
@@ -160,8 +168,10 @@ impl Engine {
             layer_hashes: HashMap::new(),
             node_hashes: HashMap::new(),
             stats: EvalStats::default(),
+            stroke,
         };
-        fn hash_layers(v: &[Layer], out: &mut HashMap<LayerId, u64>) -> u64 {
+        let ov = stroke.map(|s| (s.key, s.generation));
+        fn hash_layers(v: &[Layer], out: &mut HashMap<LayerId, u64>, ov: Option<(UploadKey, u64)>) -> u64 {
             let mut all = hasher();
             for l in v {
                 let mut h = hasher();
@@ -176,18 +186,22 @@ impl Engine {
                 }
                 match &l.kind {
                     LayerKind::Raster(g) => grid_hash(g, &mut h),
-                    LayerKind::Group(g) => hash_layers(&g.children, out).hash(&mut h),
+                    LayerKind::Group(g) => hash_layers(&g.children, out, ov).hash(&mut h),
                     LayerKind::Text(t) => hash_bytes(t).hash(&mut h),
                     LayerKind::Vector(v) => hash_bytes(v).hash(&mut h),
                     LayerKind::Fill(fl) => hash_bytes(fl).hash(&mut h),
                 }
+                if let Some((UploadKey::Content(id) | UploadKey::LayerMask(id), g)) = ov
+                    && id == l.id.0 {
+                        (0x5757_u32, g).hash(&mut h);
+                    }
                 let v = h.finish();
                 out.insert(l.id, v);
                 v.hash(&mut all);
             }
             all.finish()
         }
-        hash_layers(&req.doc.layers, &mut f.layer_hashes);
+        hash_layers(&req.doc.layers, &mut f.layer_hashes, ov);
 
         let result = match req.source {
             RenderSource::Graph => self.eval_node(&mut f, req.doc.graph.output, 0, req.rect, SocketType::Image),
@@ -317,6 +331,9 @@ impl Engine {
                 if let Some(ParamValue::Mask(Some(mid))) = node.params.get("mask")
                     && let Some(m) = f.doc.saved_mask(*mid) {
                         grid_hash(&m.mask, &mut h);
+                        if let Some(s) = f.stroke.filter(|s| s.key == UploadKey::SavedMask(mid.0)) {
+                            s.generation.hash(&mut h);
+                        }
                     }
             }
             _ => {}
@@ -793,7 +810,27 @@ impl Engine {
 
     fn upload(&mut self, f: &mut Frame, key: UploadKey, grid: &TileGrid, rect: IRect, default: f32) -> Option<GpuImage> {
         let f32 = f.format == EvalFormat::F32;
-        self.uploads.get(&self.ctx.device, &self.ctx.queue, &mut self.mips, key, grid, f.mip, rect, f32, default)
+        let img = self.uploads.get(&self.ctx.device, &self.ctx.queue, &mut self.mips, key, grid, f.mip, rect, f32, default);
+        match f.stroke {
+            Some(s) if s.key == key => self.stroke_view(f, s, img, rect, default),
+            _ => img,
+        }
+    }
+
+    /// The upload with the live stroke spliced in (block-averaged at mip > 0).
+    fn stroke_view(&mut self, f: &mut Frame, s: &GpuStroke, regular: Option<GpuImage>, rect: IRect, default: f32) -> Option<GpuImage> {
+        let Some(live) = s.live() else { return regular };
+        let k = 1i32 << f.mip;
+        let lr = live.rect;
+        let level = IRect::new(lr.x0.div_euclid(k), lr.y0.div_euclid(k), (lr.x1 + k - 1).div_euclid(k), (lr.y1 + k - 1).div_euclid(k));
+        if level.intersect(&rect).is_empty() {
+            return regular;
+        }
+        let mut out = self.new_image(f, rect);
+        let live = live.clone();
+        self.run(f, "k_stroke_view", &out, [regular.as_ref(), Some(&live), None, None], &[k as f32, s.channels() as f32, default], None);
+        out.straight = true;
+        Some(out)
     }
 
     fn layer_mask(&mut self, f: &mut Frame, layer: &Layer, rect: IRect) -> (Option<GpuImage>, f32) {
