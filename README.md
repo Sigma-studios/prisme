@@ -18,10 +18,10 @@ cargo test --workspace --release                          # tests (GPU tests use
 | `prisme-core` | Document model: sparse copy-on-write tiles (f16/f32), layers (raster, vector, text, fill, group), masks & selections, node-graph data, structurally shared undo history. No GPU/UI/IO. |
 | `prisme-color` | Colour science: working space = scene-linear Rec.2020 (f32), analytic spaces, OKLab/OKLCh, ICC via `moxcms`, display LUT baking, ΔE2000. |
 | `prisme-graph` | Node kind registry: sockets, parameter schemas (drive UI + defaults), ROI padding. |
-| `prisme-gpu` | wgpu engine: incremental tile uploads, CPU mip pyramid, viewport-driven graph evaluation with per-node content-hash caching, WGSL compute kernels, display transform pass, scopes, readbacks. |
+| `prisme-gpu` | wgpu engine: incremental tile uploads, CPU mip pyramid, viewport-driven graph evaluation with per-node content-hash caching, WGSL compute kernels, GPU brush strokes, display transform pass, scopes, readbacks. |
 | `prisme-io` | Decoders (PNG, JPEG, WebP, GIF, BMP, ICO, TGA, QOI, PNM, HDR, TIFF, JXL, EXR, AVIF, camera RAW, SVG; HEIC behind a feature) and the `.prisme` container (chunked, LZ4, deduplicated tiles, full history). |
 | `prisme-export` | PNG export: bit depth/colour mode/palette (quantette), dithering, filters, interlace, oxipng/zopfli, ICC/cICP tagging, explicit resize, target-file-size search with optional resolution reduction. |
-| `prisme-brush` | Dab brush engine with stroke buffer (opacity caps the stroke, flow builds up), presets, tablet-ready dynamics. |
+| `prisme-brush` | Dab brush engine: tablet-ready dynamics and dab placement, presets, stroke-buffer semantics (opacity caps the stroke, flow builds up). Dabs are rasterized/composited on the GPU (`prisme-gpu`), read back and landed in the tiles as one history edit when the stroke ends; the CPU compositor is the reference/fallback. |
 | `prisme-tools` | Tool state machines (selection, paint, fill, gradient, transform, crop, text, picker, clone/heal, smudge/blur, ruler…) and their pixel algorithms. |
 | `prisme-text` | Fonts (system + bundled + user), shaping, 2D effects, warps, 3D extrusion on a sphere. |
 | `prisme-vector` | SVG layers rendered from source at any zoom. |
@@ -63,4 +63,4 @@ WebGPU browser with module-worker support (all current WebGPU browsers have it).
 
 ### Automation
 `PRISME_SCRIPT="open:img.jpg;node:levels;param:m.gamma=1.3;export:out.png;quit"` drives the desktop app for
-end-to-end checks (see `crates/prisme-ui/src/script.rs`).
+end-to-end checks; `tool:Brush;stroke:x0,y0,x1,y1,…` paints (see `crates/prisme-ui/src/script.rs`).

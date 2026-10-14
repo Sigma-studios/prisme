@@ -6,13 +6,16 @@ use prisme_core::IRect;
 use std::collections::HashMap;
 use wgpu::util::DeviceExt;
 
-const SOURCE: &str = include_str!("shaders/kernels.wgsl");
+// Stroke kernels live in their own file but share the module (bindings and helpers).
+const SOURCE: &str = concat!(include_str!("shaders/kernels.wgsl"), "\n", include_str!("shaders/stroke.wgsl"));
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum OutFormat {
     Rgba16F,
     Rgba32F,
     Rgba8,
+    /// Single channel (stroke coverage, mask strokes).
+    R32F,
 }
 
 impl OutFormat {
@@ -21,6 +24,7 @@ impl OutFormat {
             OutFormat::Rgba16F => wgpu::TextureFormat::Rgba16Float,
             OutFormat::Rgba32F => wgpu::TextureFormat::Rgba32Float,
             OutFormat::Rgba8 => wgpu::TextureFormat::Rgba8Unorm,
+            OutFormat::R32F => wgpu::TextureFormat::R32Float,
         }
     }
 
@@ -29,6 +33,7 @@ impl OutFormat {
             OutFormat::Rgba16F => "rgba16float",
             OutFormat::Rgba32F => "rgba32float",
             OutFormat::Rgba8 => "rgba8unorm",
+            OutFormat::R32F => "r32float",
         }
     }
 
@@ -36,6 +41,7 @@ impl OutFormat {
         match format {
             wgpu::TextureFormat::Rgba32Float => OutFormat::Rgba32F,
             wgpu::TextureFormat::Rgba8Unorm => OutFormat::Rgba8,
+            wgpu::TextureFormat::R32Float => OutFormat::R32F,
             _ => OutFormat::Rgba16F,
         }
     }

@@ -2,7 +2,8 @@
 //!
 //! `PRISME_SCRIPT="cmd;cmd;..."`, one command per frame:
 //! `new:W,H` · `open:PATH` · `tool:<ToolKind debug name>` · `drag:x0,y0,x1,y1` (document px) ·
-//! `click:x,y` · `key:Enter|Escape` · `type:text` · `node:<kind>` · `param:key=value` (selected node) ·
+//! `stroke:x0,y0,x1,y1,…` (polyline drag) · `brush:<preset name>` · `size:N` (brush px) ·
+//! `click:x,y` · `altclick:x,y` (clone source) · `key:Enter|Escape` · `type:text` · `node:<kind>` · `param:key=value` (selected node) ·
 //! `fg:#rrggbb` · `wait:N` (frames) · `shot:PATH` (window screenshot PNG) · `export:PATH` (PNG at full res) ·
 //! `save:PATH` (.prisme) · `undo` · `redo` · `toggle-nodes` · `hdr:auto|on|off` (persisted setting) ·
 //! `hdr-status` (log surface format / colour space / headroom) · `quit`.
@@ -73,7 +74,8 @@ pub fn step(s: &mut AppState, sc: &mut Script, ctx: &egui::Context) {
             return;
         }
     }
-    if sc.pending_shot.is_some() || !s.jobs.is_empty() {
+    // Strokes land asynchronously (GPU readback): let them finish before the next command.
+    if sc.pending_shot.is_some() || !s.jobs.is_empty() || s.docs.iter().any(|d| d.stroke_pending()) {
         ctx.request_repaint();
         return;
     }
@@ -112,6 +114,43 @@ pub fn step(s: &mut AppState, sc: &mut Script, ctx: &egui::Context) {
                 crate::canvas::run_tool(s, ev(Phase::Move, [n[0] + (n[2] - n[0]) * f, n[1] + (n[3] - n[1]) * f], t + i as f64 * 0.01));
             }
             crate::canvas::run_tool(s, ev(Phase::Up, [n[2], n[3]], t + 0.3));
+        }
+        "stroke" => {
+            let n = nums(arg);
+            let pts: Vec<[f32; 2]> = n.chunks_exact(2).map(|p| [p[0], p[1]]).collect();
+            if let Some(first) = pts.first() {
+                let mut i = 0;
+                crate::canvas::run_tool(s, ev(Phase::Down, *first, t));
+                for w in pts.windows(2) {
+                    for k in 1..=12 {
+                        let f = k as f32 / 12.0;
+                        i += 1;
+                        crate::canvas::run_tool(s, ev(Phase::Move, [w[0][0] + (w[1][0] - w[0][0]) * f, w[0][1] + (w[1][1] - w[0][1]) * f], t + i as f64 * 0.01));
+                    }
+                }
+                crate::canvas::run_tool(s, ev(Phase::Up, *pts.last().unwrap(), t + i as f64 * 0.01 + 0.01));
+            }
+        }
+        "brush" => {
+            if let Some(p) = prisme_brush::presets().into_iter().find(|p| p.name.eq_ignore_ascii_case(arg)) {
+                s.settings.tools.brush = p.settings;
+            }
+        }
+        "size" => {
+            if let Ok(v) = arg.parse::<f32>() {
+                s.settings.tools.brush.size = v;
+                s.settings.tools.eraser.size = v;
+                s.settings.tools.clone_brush.size = v;
+                s.settings.tools.retouch_brush.size = v;
+            }
+        }
+        "altclick" => {
+            let n = nums(arg);
+            let mut e = ev(Phase::Down, [n[0], n[1]], t);
+            e.mods.alt = true;
+            crate::canvas::run_tool(s, e);
+            e.phase = Phase::Up;
+            crate::canvas::run_tool(s, e);
         }
         "click" => {
             let n = nums(arg);

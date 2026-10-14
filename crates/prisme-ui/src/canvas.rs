@@ -185,8 +185,14 @@ pub fn canvas_tab(s: &mut AppState, ui: &mut Ui) {
         let tool = s.tool;
         if let (Some(t), Some(d)) = (s.tools.get_mut(&tool), s.docs.get_mut(active))
             && let Some(w) = d.working.as_mut() {
-                let mut cx = ToolCx { doc: w, opts: &opts, fg, bg };
-                if t.tick(&mut cx, time) == ToolOutcome::Preview {
+                let mut ops = vec![];
+                let gpu = s.gpu.as_mut();
+                let mut cx = ToolCx { doc: w, opts: &opts, fg, bg, strokes: gpu.is_some().then_some(&mut ops) };
+                let out = t.tick(&mut cx, time);
+                if let Some(g) = gpu {
+                    crate::stroke::feed(d, &mut g.engine, ops);
+                }
+                if out == ToolOutcome::Preview {
                     d.touch();
                 }
             }
@@ -267,13 +273,23 @@ pub fn run_tool(s: &mut AppState, ev: ToolInput) {
     }
     let Some(d) = s.docs.get_mut(s.active) else { return };
     let Some(tool) = s.tools.get_mut(&tool_kind) else { return };
+    // New interactions start from the landed previous stroke.
+    if ev.phase != Phase::Hover {
+        d.finish_stroke();
+    }
     if d.working.is_none() {
         d.working = Some(d.history.current().clone());
     }
+    // With a GPU, dab tools emit stroke ops instead of writing tiles (crate::stroke).
+    let mut ops = vec![];
+    let gpu = s.gpu.as_mut();
     let outcome = {
-        let mut cx = ToolCx { doc: d.working.as_mut().unwrap(), opts: &opts, fg, bg };
+        let mut cx = ToolCx { doc: d.working.as_mut().unwrap(), opts: &opts, fg, bg, strokes: gpu.is_some().then_some(&mut ops) };
         tool.input(&mut cx, &ev)
     };
+    if let Some(g) = gpu {
+        crate::stroke::feed(d, &mut g.engine, ops);
+    }
     let busy = tool.busy();
     apply_outcome(s, outcome, busy);
 }
@@ -421,7 +437,7 @@ fn render(s: &mut AppState, ctx: &egui::Context, rect: Rect, ppp: f32, painter: 
             .intersect(&level_doc);
         let max = g.engine.ctx.max_texture_size() as i32;
         let eval = if eval.width() > max || eval.height() > max { need } else { eval };
-        let img = g.engine.evaluate(&EvalRequest { doc, rect: eval, mip, format: EvalFormat::F16, source });
+        let img = g.engine.evaluate_with(&EvalRequest { doc, rect: eval, mip, format: EvalFormat::F16, source }, d.stroke.as_ref().map(|st| &st.gpu));
         d.render.image = img;
         d.render.key = Some((d.version, eval, mip, src_tag));
         d.render.mip = mip;

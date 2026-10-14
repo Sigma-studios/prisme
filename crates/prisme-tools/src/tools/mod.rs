@@ -135,6 +135,8 @@ pub struct ToolCx<'a> {
     /// Linear working RGBA.
     pub fg: [f32; 4],
     pub bg: [f32; 4],
+    /// GPU host: dab tools emit their strokes here instead of writing tiles (see [`crate::stroke`]).
+    pub strokes: Option<&'a mut Vec<crate::StrokeOp>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -267,7 +269,7 @@ mod tests {
         let opts = ToolOptions::default();
         let mut out = vec![];
         for (i, (ph, p)) in events.iter().enumerate() {
-            let mut cx = ToolCx { doc, opts: &opts, fg: [1.0, 0.0, 0.0, 1.0], bg: [1.0; 4] };
+            let mut cx = ToolCx { doc, opts: &opts, fg: [1.0, 0.0, 0.0, 1.0], bg: [1.0; 4], strokes: None };
             let mut ev = ToolInput::mouse(*ph, *p);
             ev.mods = mods;
             ev.time = i as f64 * 0.016;
@@ -329,7 +331,7 @@ mod tests {
         let mut t = make_tool(ToolKind::Crop);
         run(t.as_mut(), &mut doc, &[(Phase::Down, [10.0, 10.0]), (Phase::Move, [60.0, 40.0]), (Phase::Up, [60.0, 40.0])], Modifiers::default());
         let opts = ToolOptions::default();
-        let mut cx = ToolCx { doc: &mut doc, opts: &opts, fg: [0.0; 4], bg: [1.0; 4] };
+        let mut cx = ToolCx { doc: &mut doc, opts: &opts, fg: [0.0; 4], bg: [1.0; 4], strokes: None };
         assert_eq!(t.key(&mut cx, &ToolKey::Enter), ToolOutcome::Commit("Crop".into()));
         assert_eq!((doc.info.width, doc.info.height), (50, 30));
     }
@@ -341,7 +343,7 @@ mod tests {
         let r = run(t.as_mut(), &mut doc, &[(Phase::Down, [50.0, 100.0])], Modifiers::default());
         let ToolOutcome::EditText(id) = r[0] else { panic!("{r:?}") };
         let opts = ToolOptions::default();
-        let mut cx = ToolCx { doc: &mut doc, opts: &opts, fg: [0.0; 4], bg: [1.0; 4] };
+        let mut cx = ToolCx { doc: &mut doc, opts: &opts, fg: [0.0; 4], bg: [1.0; 4], strokes: None };
         t.key(&mut cx, &ToolKey::Text("Hello".into()));
         t.key(&mut cx, &ToolKey::Backspace);
         assert_eq!(t.key(&mut cx, &ToolKey::Escape), ToolOutcome::Commit("Edit Text".into()));

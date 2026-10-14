@@ -183,7 +183,27 @@ impl BlendTarget {
     }
 }
 
+/// Dab-driven retouching that reads pixels (per-dab, order dependent).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RetouchMode {
+    Smudge { strength: f32 },
+    Blur { strength: f32 },
+    Clone { offset: [f32; 2] },
+    Heal { offset: [f32; 2] },
+}
+
+/// What a dab stroke does to its target. Shared by the CPU canvases ([`StrokeCanvas`],
+/// `prisme_tools::paint::RetouchCanvas`) and the GPU stroke buffer in `prisme-gpu`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum StrokeMode {
+    /// Coverage-buffer stroke: opacity caps the stroke, flow builds up.
+    Paint { target: BlendTarget, opacity: f32, lock_alpha: bool },
+    Retouch(RetouchMode),
+}
+
 /// Accumulates dab coverage for one stroke and composites it onto the base snapshot.
+/// CPU reference path: interactive painting runs on the GPU (`prisme_gpu::GpuStroke`); this
+/// is used headless, for brush previews and to replay a stroke when a readback can't be awaited.
 pub struct StrokeCanvas {
     base: Arc<TileGrid>,
     coverage: TileGrid,

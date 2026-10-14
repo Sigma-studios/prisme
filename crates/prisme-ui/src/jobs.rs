@@ -104,7 +104,10 @@ pub fn save(s: &mut AppState, save_as: bool) {
 
 /// Save document `i` (encoded in the background). Returns false when nothing was started.
 pub fn save_doc(s: &mut AppState, i: usize, save_as: bool) -> bool {
-    let Some(d) = s.docs.get(i) else { return false };
+    let Some(d) = s.docs.get_mut(i) else { return false };
+    // Land a GPU stroke still in flight so it is part of what gets saved.
+    d.finish_stroke();
+    let d = &s.docs[i];
     let (doc_id, rev) = (d.id, d.history.revision());
     // Encoding runs in the background (thread / Web Worker); the history clone is cheap.
     let encoded = prisme_platform::spawn_worker(SaveJob { history: d.history.clone(), include_history: true }).pending;
@@ -172,6 +175,14 @@ pub fn quit_flow(s: &mut AppState, ctx: &egui::Context) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
+}
+
+/// Forget every autosave (clean exit).
+pub fn clear_autosaves(s: &AppState) {
+    for d in &s.docs {
+        prisme_platform::storage_delete(&format!("autosave/{}", d.id));
+    }
+    prisme_platform::storage_delete(INDEX_KEY);
 }
 
 /// Forget autosaves of documents the user chose to discard.

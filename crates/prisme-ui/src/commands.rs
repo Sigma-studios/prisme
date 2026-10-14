@@ -112,7 +112,7 @@ fn tool_key(s: &mut AppState, key: &ToolKey) -> bool {
         d.working = Some(d.history.current().clone());
     }
     let out = {
-        let mut cx = ToolCx { doc: d.working.as_mut().unwrap(), opts: &opts, fg, bg };
+        let mut cx = ToolCx { doc: d.working.as_mut().unwrap(), opts: &opts, fg, bg, strokes: None };
         tool.key(&mut cx, key)
     };
     let busy = tool.busy();
@@ -126,6 +126,10 @@ fn tool_key(s: &mut AppState, key: &ToolKey) -> bool {
 }
 
 pub fn run_action(s: &mut AppState, a: Action, ctx: &egui::Context) {
+    // Actions see the document with any finished GPU stroke landed.
+    if let Some(d) = s.doc_mut() {
+        d.finish_stroke();
+    }
     match a {
         Action::New => s.dialogs.new_doc.open = true,
         Action::Open => crate::jobs::open_dialog(s),
@@ -257,6 +261,7 @@ pub fn close_doc(s: &mut AppState, i: usize) {
     if i >= s.docs.len() {
         return;
     }
+    s.docs[i].finish_stroke();
     if s.docs[i].is_dirty() && s.dialogs.confirm_close != Some(i) {
         s.dialogs.confirm_close = Some(i);
         return;

@@ -89,6 +89,8 @@ pub struct DocState {
     pub placeholder: Option<egui::TextureHandle>,
     /// Selection outline cache: (selection tile-ids hash, polylines in doc space).
     pub outline: Option<(u64, Vec<Vec<[f32; 2]>>)>,
+    /// GPU brush stroke being painted or waiting to land (see `crate::stroke`).
+    pub stroke: Option<crate::stroke::DocStroke>,
 }
 
 static NEXT_DOC_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -111,6 +113,7 @@ impl DocState {
             selected_node: None,
             placeholder: None,
             outline: None,
+            stroke: None,
         }
     }
 
@@ -126,7 +129,7 @@ impl DocState {
     }
 
     pub fn is_dirty(&self) -> bool {
-        self.history.revision() != self.saved_revision
+        self.history.revision() != self.saved_revision || self.stroke_pending()
     }
 
     pub fn title(&self) -> String {
@@ -140,6 +143,7 @@ impl DocState {
 
     /// Commit an edit made through a closure (applies to the working copy if one exists).
     pub fn edit(&mut self, label: &str, f: impl FnOnce(&mut Document)) {
+        self.finish_stroke();
         match &mut self.working {
             Some(w) => f(w),
             None => {
@@ -153,6 +157,7 @@ impl DocState {
 
     /// Like `edit` but merges consecutive edits with the same key (slider drags).
     pub fn edit_merge(&mut self, label: &str, key: u64, f: impl FnOnce(&mut Document)) {
+        self.finish_stroke();
         match &mut self.working {
             Some(w) => f(w),
             None => {
@@ -178,6 +183,7 @@ impl DocState {
     }
 
     pub fn commit_working(&mut self, label: &str) {
+        self.finish_stroke();
         if let Some(w) = self.working.take() {
             self.history.push(label, w);
         }
@@ -191,12 +197,14 @@ impl DocState {
     }
 
     pub fn undo(&mut self) {
+        self.finish_stroke();
         self.working = None;
         self.history.undo();
         self.touch();
     }
 
     pub fn redo(&mut self) {
+        self.finish_stroke();
         self.working = None;
         self.history.redo();
         self.touch();

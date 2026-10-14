@@ -8,6 +8,7 @@ license.workspace = true
 prisme-core = { workspace = true }
 prisme-graph = { workspace = true }
 prisme-color = { workspace = true }
+prisme-brush = { workspace = true }
 wgpu = { version = "30", default-features = false, features = ["wgsl", "std"] }
 bytemuck = { workspace = true }
 half = { workspace = true }
@@ -20,5 +21,6 @@ serde = { workspace = true }
 rayon = { workspace = true }
 
 [dev-dependencies]
+prisme-tools = { workspace = true }
 pollster = "0.4"
 wgpu = { version = "30", features = ["metal", "vulkan", "dx12", "wgsl"] }

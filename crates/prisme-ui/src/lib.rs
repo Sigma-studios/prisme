@@ -16,6 +16,7 @@ pub mod rasterizer;
 pub mod script;
 pub mod settings;
 pub mod shortcuts;
+pub mod stroke;
 pub mod theme;
 pub mod widgets;
 

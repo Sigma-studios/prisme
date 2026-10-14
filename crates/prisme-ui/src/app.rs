@@ -337,6 +337,7 @@ impl eframe::App for PrismeApp {
         let ctx = ui.ctx().clone();
         let s = &mut self.s;
         crate::jobs::poll(s, &ctx);
+        crate::stroke::poll(s, &ctx);
         if let Some(sc) = &mut self.script {
             crate::script::step(s, sc, &ctx);
         }
@@ -355,9 +356,17 @@ impl eframe::App for PrismeApp {
 
         crate::hdr::update(s, &ctx);
         // Window close with unsaved documents: hold it and ask.
-        if ctx.input(|i| i.viewport().close_requested()) && !s.dialogs.allow_quit && s.docs.iter().any(|d| d.is_dirty()) {
+        let closing = ctx.input(|i| i.viewport().close_requested());
+        if closing {
+            // A stroke still landing isn't in the history yet: land it before checking dirtiness.
+            s.docs.iter_mut().for_each(|d| d.finish_stroke());
+        }
+        if closing && !s.dialogs.allow_quit && s.docs.iter().any(|d| d.is_dirty()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             s.dialogs.confirm_quit = true;
+        } else if closing {
+            // Clean exit (all saved, or changes discarded): nothing to recover next launch.
+            crate::jobs::clear_autosaves(s);
         }
         crate::jobs::quit_flow(s, &ctx);
         crate::commands::handle_shortcuts(s, &ctx);
