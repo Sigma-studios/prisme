@@ -1,10 +1,12 @@
 //! Scripted automation for end-to-end tests and screenshots (native).
 //!
 //! `PRISME_SCRIPT="cmd;cmd;..."`, one command per frame:
-//! `new:W,H` · `open:PATH` · `tool:<ToolKind debug name>` · `drag:x0,y0,x1,y1` (document px) ·
+//! `new:W,H` · `new-infinite:W,H[,0]` (infinite canvas, W×H initial frame, white background; 0: transparent) · `open:PATH` · `tool:<ToolKind debug name>` · `drag:x0,y0,x1,y1` (document px) ·
 //! `stroke:x0,y0,x1,y1,…` (polyline drag) · `brush:<preset name>` · `size:N` (brush px) ·
 //! `click:x,y` · `altclick:x,y` (clone source) · `key:Enter|Escape` · `type:text` · `node:<kind>` · `param:key=value` (selected node) ·
 //! `fg:#rrggbb` · `wait:N` (frames) · `shot:PATH` (window screenshot PNG) · `export:PATH` (PNG at full res) ·
+//! `export-sel:PATH` (Export Selection) · `action:<Action debug name>` (e.g. `action:CopyMerged`) ·
+//! `clip:PATH` (internal clipboard as PNG, export settings) ·
 //! `save:PATH` (.prisme) · `undo` · `redo` · `toggle-nodes` · `hdr:auto|on|off` (persisted setting) ·
 //! `hdr-status` (log surface format / colour space / headroom) · `quit`.
 
@@ -90,11 +92,29 @@ pub fn step(s: &mut AppState, sc: &mut Script, ctx: &egui::Context) {
     let (name, arg) = cmd.split_once(':').unwrap_or((cmd.as_str(), ""));
     let t = prisme_platform::now_seconds();
     match name {
-        "new" => {
+        "new" | "new-infinite" => {
             let n = nums(arg);
-            let d = prisme_core::Document::with_background("Script", n[0] as u32, n[1] as u32, Some([1.0; 4]));
+            let (w, h) = (n[0] as u32, n[1] as u32);
+            let d = if name == "new" { prisme_core::Document::with_background("Script", w, h, Some([1.0; 4])) } else { prisme_core::Document::infinite("Script", w, h, (n.get(2) != Some(&0.0)).then_some([1.0; 4])) };
             s.add_doc(crate::doc::DocState::new(d));
         }
+        "action" => match crate::actions::Action::all().into_iter().find(|a| format!("{a:?}").eq_ignore_ascii_case(arg)) {
+            Some(a) => crate::commands::run_action(s, a, ctx),
+            None => log::warn!("script: unknown action {arg}"),
+        },
+        "clip" => match s.clipboard.clone() {
+            Some((g, b)) => {
+                let px = g.read_rect(&b);
+                match prisme_export::encode_png(&px, b.width() as u32, b.height() as u32, &s.settings.export, &mut |_, _| {}, &|| false) {
+                    Ok(r) => {
+                        let _ = prisme_platform::write_file_path(std::path::Path::new(arg), &r.bytes);
+                        log::info!("script: clipboard {}x{} at {},{} -> {arg}", b.width(), b.height(), b.x0, b.y0);
+                    }
+                    Err(e) => log::error!("script: clipboard encode failed: {e}"),
+                }
+            }
+            None => log::warn!("script: clipboard is empty"),
+        },
         "open" => {
             if let Ok(b) = std::fs::read(arg) {
                 crate::jobs::decode_file(s, std::path::Path::new(arg).file_name().unwrap().to_string_lossy().into(), b, None, None);
@@ -214,9 +234,10 @@ pub fn step(s: &mut AppState, sc: &mut Script, ctx: &egui::Context) {
             sc.pending_shot = Some(arg.to_string());
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
         }
-        "export" => {
+        "export" | "export-sel" => {
             s.dialogs.export.pixels = None;
-            crate::jobs::start_render(s, false);
+            s.dialogs.export.selection = name == "export-sel";
+            crate::dialogs::start_export_render(s);
             sc.export_path = Some(arg.to_string());
         }
         "save" => {

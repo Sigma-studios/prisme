@@ -13,7 +13,7 @@ struct View {
     tex_size: vec2<f32>,
     level_scale: f32,
     nearest: f32,
-    doc_size: vec2<f32>,
+    doc_size: vec2<f32>,    // negative: no page (infinite canvas)
     checker: f32,
     has_lut: f32,
     disp0: vec4<f32>,
@@ -103,7 +103,8 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     let fb = pos.xy;
     let doc = vec2<f32>(dot(v.fb_to_doc0.xyz, vec3<f32>(fb, 1.0)), dot(v.fb_to_doc1.xyz, vec3<f32>(fb, 1.0)));
     var out: vec3<f32>;
-    if (doc.x < 0.0 || doc.y < 0.0 || doc.x >= v.doc_size.x || doc.y >= v.doc_size.y) {
+    // f32 absolute doc coords: sub-pixel exact to ~±1e6 px (see prisme_core::CanvasKind).
+    if (v.doc_size.x >= 0.0 && (doc.x < 0.0 || doc.y < 0.0 || doc.x >= v.doc_size.x || doc.y >= v.doc_size.y)) {
         out = v.bg.rgb;
     } else {
         let c = fetch(doc * v.level_scale) * vec4<f32>(vec3<f32>(exp2(v.exposure)), 1.0);

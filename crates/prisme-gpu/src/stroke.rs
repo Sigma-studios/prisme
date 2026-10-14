@@ -27,7 +27,7 @@ use std::sync::Arc;
 const TS: i32 = TILE_SIZE as i32;
 /// Dabs per accumulation dispatch (keeps each dispatch rect tight on long, fast strokes).
 const BATCH: usize = 64;
-const G: Globals = Globals { level_scale: 1.0, mip: 0, doc_w: 0.0, doc_h: 0.0 };
+const G: Globals = Globals { level_scale: 1.0, mip: 0, doc_w: 0.0, doc_h: 0.0, infinite: false };
 
 fn align(r: IRect) -> IRect {
     IRect::new(r.x0.div_euclid(TS) * TS, r.y0.div_euclid(TS) * TS, (r.x1 + TS - 1).div_euclid(TS) * TS, (r.y1 + TS - 1).div_euclid(TS) * TS)

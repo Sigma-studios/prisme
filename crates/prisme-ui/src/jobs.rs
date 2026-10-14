@@ -34,7 +34,7 @@ pub fn describe(jobs: &[Job]) -> String {
     jobs.iter()
         .map(|j| match j {
             Job::Decode { name, .. } => format!("Opening {name}"),
-            Job::Render(r) => format!("Rendering {:.0}%", r.next as f32 / r.tiles.len().max(1) as f32 * 100.0),
+            Job::Render(r) => format!("{} {:.0}%", if r.purpose == RenderPurpose::CopyMerged { "Copying" } else { "Rendering" }, r.next as f32 / r.tiles.len().max(1) as f32 * 100.0),
             Job::Encode { control, .. } => match control.progress() {
                 Some((f, stage)) => format!("Encoding PNG {:.0}% ({stage})", f * 100.0),
                 None => "Encoding PNG".into(),
@@ -214,39 +214,77 @@ pub fn load_lut(s: &mut AppState, node: NodeId, key: String) {
 
 // ------------------------------------------------------------------ export rendering
 
-/// Renders the graph output at full resolution (f32) tile by tile with async readbacks.
+/// What a [`RenderJob`] is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RenderPurpose {
+    /// Pixels for the export dialog (encoded right away when `then_encode`).
+    Export { then_encode: bool },
+    /// Edit ▸ Copy Merged.
+    CopyMerged,
+}
+
+/// Renders the graph output over `rect` at full resolution (f32) tile by tile with async
+/// readbacks (works the same on the web); `mask` (the selection) multiplies the alpha.
 pub struct RenderJob {
     pub doc: Document,
+    /// Document-space region; `pixels` are its straight-alpha RGBA rows once done.
+    pub rect: IRect,
+    pub mask: Option<Arc<prisme_core::TileGrid>>,
     pub tiles: Vec<IRect>,
     pub next: usize,
     pub pending: Option<(IRect, Readback)>,
     pub pixels: Vec<f32>,
-    pub then_encode: bool,
+    pub purpose: RenderPurpose,
 }
 
-pub fn start_render(s: &mut AppState, then_encode: bool) {
+/// Largest region rendered in one go (f32 RGBA: 16 bytes/px).
+const MAX_RENDER_PIXELS: i64 = 1 << 28;
+
+/// Region rendered for export / Copy Merged: the selection's bounds and mask when `selection`
+/// and there is one, else the page (Fixed) or the content bounds (Infinite).
+pub fn render_region(s: &AppState, doc: &Document, selection: bool) -> (IRect, Option<Arc<prisme_core::TileGrid>>) {
+    match &doc.selection {
+        Some(sel) if selection => {
+            let b = sel.content_bounds();
+            (if doc.info.is_infinite() { b } else { b.intersect(&doc.bounds()) }, Some(sel.clone()))
+        }
+        _ => (crate::commands::doc_extent(s, doc), None),
+    }
+}
+
+/// Start rendering the active document's region (see [`render_region`]) for `purpose`.
+pub fn start_render(s: &mut AppState, selection: bool, purpose: RenderPurpose) {
     let Some(d) = s.doc() else { return };
     let doc = d.doc().clone();
-    let (w, h) = (doc.info.width as i32, doc.info.height as i32);
+    let (rect, mask) = render_region(s, &doc, selection);
+    if rect.is_empty() {
+        s.toast("Nothing to render: the selection is empty");
+        return;
+    }
+    if rect.area() > MAX_RENDER_PIXELS {
+        s.toast(format!("{} × {} px is too large to render at once: select a smaller region", rect.width(), rect.height()));
+        return;
+    }
     let ts = 2048;
     let mut tiles = vec![];
-    for y in (0..h).step_by(ts as usize) {
-        for x in (0..w).step_by(ts as usize) {
-            tiles.push(IRect::new(x, y, (x + ts).min(w), (y + ts).min(h)));
+    for y in (rect.y0..rect.y1).step_by(ts as usize) {
+        for x in (rect.x0..rect.x1).step_by(ts as usize) {
+            tiles.push(IRect::new(x, y, (x + ts).min(rect.x1), (y + ts).min(rect.y1)));
         }
     }
-    s.jobs.retain(|j| !matches!(j, Job::Render(_)));
-    s.jobs.push(Job::Render(RenderJob { pixels: vec![0.0; (w * h * 4) as usize], doc, tiles, next: 0, pending: None, then_encode }));
+    s.jobs.retain(|j| !matches!(j, Job::Render(r) if r.purpose == purpose || matches!((r.purpose, purpose), (RenderPurpose::Export { .. }, RenderPurpose::Export { .. }))));
+    let pixels = vec![0.0; rect.area() as usize * 4];
+    s.jobs.push(Job::Render(RenderJob { pixels, doc, rect, mask, tiles, next: 0, pending: None, purpose }));
 }
 
 fn step_render(s: &mut AppState, r: &mut RenderJob) -> bool {
     let Some(g) = s.gpu.as_mut() else { return true };
     if let Some((rect, rb)) = &r.pending {
         let Some(data) = rb.try_take(&g.rs.device) else { return false };
-        let w = r.doc.info.width as usize;
+        let w = r.rect.width() as usize;
         let rw = rect.width() as usize;
         for y in 0..rect.height() as usize {
-            let dst = ((rect.y0 as usize + y) * w + rect.x0 as usize) * 4;
+            let dst = ((rect.y0 - r.rect.y0) as usize + y) * w * 4 + (rect.x0 - r.rect.x0) as usize * 4;
             if data.len() >= (y + 1) * rw * 4 {
                 r.pixels[dst..dst + rw * 4].copy_from_slice(&data[y * rw * 4..(y + 1) * rw * 4]);
             }
@@ -254,12 +292,18 @@ fn step_render(s: &mut AppState, r: &mut RenderJob) -> bool {
         r.pending = None;
     }
     if r.next >= r.tiles.len() {
-        // Un-premultiply for the encoder.
+        // Un-premultiply for the encoder, then apply the selection's alpha.
         for p in r.pixels.chunks_exact_mut(4) {
             if p[3] > 1e-7 {
                 p[0] /= p[3];
                 p[1] /= p[3];
                 p[2] /= p[3];
+            }
+        }
+        if let Some(m) = &r.mask {
+            let a = m.read_rect(&r.rect);
+            for (p, a) in r.pixels.chunks_exact_mut(4).zip(a) {
+                p[3] *= a.clamp(0.0, 1.0);
             }
         }
         return true;
@@ -443,12 +487,21 @@ pub fn poll(s: &mut AppState, ctx: &egui::Context) {
             },
             Job::Render(mut r) => {
                 if step_render(s, &mut r) {
-                    let (w, h) = (r.doc.info.width, r.doc.info.height);
-                    let px = Arc::new(std::mem::take(&mut r.pixels));
-                    s.dialogs.export.pixels = Some((px.clone(), w, h));
-                    start_estimate(s, px.clone(), w, h);
-                    if r.then_encode {
-                        start_encode(s, px, w, h);
+                    let (w, h) = (r.rect.width() as u32, r.rect.height() as u32);
+                    match r.purpose {
+                        RenderPurpose::CopyMerged => {
+                            let mut g = prisme_core::TileGrid::from_dense(prisme_core::PixelFormat::F32, 4, w, h, &r.pixels).translated(r.rect.x0, r.rect.y0);
+                            g.remove_clear_tiles();
+                            crate::commands::set_clipboard(s, g, r.rect);
+                        }
+                        RenderPurpose::Export { then_encode } => {
+                            let px = Arc::new(std::mem::take(&mut r.pixels));
+                            s.dialogs.export.pixels = Some((px.clone(), w, h));
+                            start_estimate(s, px.clone(), w, h);
+                            if then_encode {
+                                start_encode(s, px, w, h);
+                            }
+                        }
                     }
                 } else {
                     keep.push(Job::Render(r));

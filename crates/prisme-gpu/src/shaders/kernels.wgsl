@@ -18,8 +18,12 @@ struct Info {
     connected: vec4<u32>,
     level_scale: f32,   // level px per document px
     mip: f32,
-    doc_w: f32,
+    doc_w: f32,         // page (Fixed) / nominal frame (Infinite)
     doc_h: f32,
+    infinite: f32,      // 1: no page edge
+    pad0: f32,
+    pad1: f32,
+    pad2: f32,
 };
 
 @group(0) @binding(0) var<uniform> info: Info;
@@ -75,13 +79,14 @@ fn ld1c(p: vec2<i32>) -> vec4<f32> {
 }
 
 // Edge handling for filters: 0 = extend the document's edge pixels (Photoshop-like),
-// 1 = treat everything outside the document as transparent.
+// 1 = treat everything outside the document as transparent. Infinite canvases have no
+// edge: always transparent past the content.
 fn doc_edge(p: vec2<i32>) -> vec2<i32> {
     let m = vec2<i32>(ceil(vec2<f32>(info.doc_w, info.doc_h) * info.level_scale)) - 1;
     return clamp(p, vec2<i32>(0), max(m, vec2<i32>(0)));
 }
 fn ld0e(p: vec2<i32>, mode: f32) -> vec4<f32> {
-    if (mode < 0.5) { return ld0c(doc_edge(p)); }
+    if (mode < 0.5 && info.infinite < 0.5) { return ld0c(doc_edge(p)); }
     return ld0(p);
 }
 

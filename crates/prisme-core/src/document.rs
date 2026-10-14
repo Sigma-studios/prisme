@@ -1,13 +1,27 @@
 use crate::geom::{Affine2, IRect};
 use crate::graph::{Graph, ParamValue};
 use crate::ids::{LayerId, MaskId};
-use crate::layer::{FillContent, GroupLayer, Layer, LayerKind};
+use crate::layer::{FillContent, FillLayer, GroupLayer, Layer, LayerKind};
 use crate::mask::{Mask, SavedMask};
 use crate::tile::{PixelFormat, TileGrid};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// Page model of a document.
+///
+/// `Infinite` documents have no page: layers are sparse tiles with i32 coordinates, so content
+/// can live anywhere; `width`/`height` then only name a nominal frame at the origin (the area
+/// shown when empty, reference for Vignette / Transform node centres and default geometry).
+/// Limit: view and display transforms are f32 in absolute document pixels, which stays
+/// sub-pixel accurate up to about ±1e6 px from the origin (~0.06 px steps there).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CanvasKind {
+    #[default]
+    Fixed,
+    Infinite,
+}
+
+#[derive(Clone, Debug)]
 pub struct DocumentInfo {
     pub name: String,
     pub width: u32,
@@ -17,6 +31,80 @@ pub struct DocumentInfo {
     pub dpi: f32,
     /// Original embedded ICC profile of the first imported source (informational).
     pub source_profile: Option<String>,
+    /// Serde: defaults to Fixed (see `with_legacy_info` for the postcard containers).
+    pub canvas: CanvasKind,
+}
+
+impl DocumentInfo {
+    pub fn is_infinite(&self) -> bool {
+        self.canvas == CanvasKind::Infinite
+    }
+}
+
+// postcard isn't self-describing: `serde(default)` can't see that v1 `.prisme` files lack the
+// trailing `canvas` field, so their loader flags the old layout with `with_legacy_info`.
+thread_local! {
+    static LEGACY_INFO: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` (de)serializing `DocumentInfo` in its v1 layout (no `canvas`: loads as Fixed).
+pub fn with_legacy_info<R>(f: impl FnOnce() -> R) -> R {
+    let prev = LEGACY_INFO.with(|c| c.replace(true));
+    let r = f();
+    LEGACY_INFO.with(|c| c.set(prev));
+    r
+}
+
+impl Serialize for DocumentInfo {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let legacy = LEGACY_INFO.with(|c| c.get());
+        let mut st = s.serialize_struct("DocumentInfo", if legacy { 6 } else { 7 })?;
+        st.serialize_field("name", &self.name)?;
+        st.serialize_field("width", &self.width)?;
+        st.serialize_field("height", &self.height)?;
+        st.serialize_field("format", &self.format)?;
+        st.serialize_field("dpi", &self.dpi)?;
+        st.serialize_field("source_profile", &self.source_profile)?;
+        if !legacy {
+            st.serialize_field("canvas", &self.canvas)?;
+        }
+        st.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for DocumentInfo {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename = "DocumentInfo")]
+        struct V1 {
+            name: String,
+            width: u32,
+            height: u32,
+            format: PixelFormat,
+            dpi: f32,
+            source_profile: Option<String>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename = "DocumentInfo")]
+        struct V2 {
+            name: String,
+            width: u32,
+            height: u32,
+            format: PixelFormat,
+            dpi: f32,
+            source_profile: Option<String>,
+            #[serde(default)]
+            canvas: CanvasKind,
+        }
+        let v = if LEGACY_INFO.with(|c| c.get()) {
+            let v = V1::deserialize(d)?;
+            V2 { name: v.name, width: v.width, height: v.height, format: v.format, dpi: v.dpi, source_profile: v.source_profile, canvas: CanvasKind::Fixed }
+        } else {
+            V2::deserialize(d)?
+        };
+        Ok(DocumentInfo { name: v.name, width: v.width, height: v.height, format: v.format, dpi: v.dpi, source_profile: v.source_profile, canvas: v.canvas })
+    }
 }
 
 /// A complete document state. Cheap to clone (heavy data is behind `Arc`s).
@@ -35,7 +123,7 @@ pub struct Document {
 impl Document {
     pub fn new(name: impl Into<String>, width: u32, height: u32, format: PixelFormat) -> Self {
         Document {
-            info: DocumentInfo { name: name.into(), width, height, format, dpi: 72.0, source_profile: None },
+            info: DocumentInfo { name: name.into(), width, height, format, dpi: 72.0, source_profile: None, canvas: CanvasKind::Fixed },
             layers: vec![],
             masks: vec![],
             selection: None,
@@ -59,8 +147,60 @@ impl Document {
         d
     }
 
+    /// New infinite-canvas document: an empty raster layer over an (unbounded) solid Fill
+    /// background when `fill` is set. `width`×`height` is the nominal frame (see [`CanvasKind`]).
+    pub fn infinite(name: impl Into<String>, width: u32, height: u32, fill: Option<[f32; 4]>) -> Self {
+        let mut d = Document::new(name, width, height, PixelFormat::F16);
+        d.info.canvas = CanvasKind::Infinite;
+        if let Some(c) = fill {
+            let id = d.alloc_layer_id();
+            d.layers.push(Layer::new(id, "Background", LayerKind::Fill(FillLayer { content: FillContent::Solid(c) })));
+        }
+        let id = d.alloc_layer_id();
+        d.layers.push(Layer::new(id, "Layer 1", LayerKind::Raster(Arc::new(TileGrid::rgba(PixelFormat::F16)))));
+        d.active_layer = Some(id);
+        d
+    }
+
+    /// The page. For Infinite documents only the nominal frame: use [`Document::content_bounds`]
+    /// / [`Document::extent`] for anything content-related.
     pub fn bounds(&self) -> IRect {
         IRect::from_size(self.info.width, self.info.height)
+    }
+
+    /// Union of the visible layers' content bounds. Raster layers use their exact alpha bounds
+    /// when `exact` (scans every tile), else tile bounds; `other` bounds text/vector layers
+    /// (None = rough estimate). Fill layers are unbounded and skipped; masks aren't applied
+    /// (conservative).
+    pub fn content_bounds(&self, exact: bool, other: Option<&dyn Fn(&Layer) -> Option<IRect>>) -> IRect {
+        fn walk(v: &[Layer], exact: bool, other: Option<&dyn Fn(&Layer) -> Option<IRect>>, acc: &mut IRect) {
+            for l in v.iter().filter(|l| l.visible && l.opacity > 0.0) {
+                let r = match &l.kind {
+                    LayerKind::Raster(g) if exact => g.content_bounds(),
+                    LayerKind::Raster(g) => g.tile_bounds(),
+                    LayerKind::Group(g) => {
+                        walk(&g.children, exact, other, acc);
+                        continue;
+                    }
+                    LayerKind::Fill(_) => continue,
+                    LayerKind::Vector(_) | LayerKind::Text(_) => other.and_then(|f| f(l)).unwrap_or_else(|| estimate_bounds(l)),
+                };
+                *acc = acc.union(&r);
+            }
+        }
+        let mut r = IRect::EMPTY;
+        walk(&self.layers, exact, other, &mut r);
+        r
+    }
+
+    /// The finite area standing for the whole document: the page (Fixed), else the coarse
+    /// content bounds, or the nominal frame when empty (navigator, thumbnails).
+    pub fn extent(&self) -> IRect {
+        if !self.info.is_infinite() {
+            return self.bounds();
+        }
+        let r = self.content_bounds(false, None);
+        if r.is_empty() { self.bounds() } else { r }
     }
 
     pub fn alloc_layer_id(&mut self) -> LayerId {
@@ -467,9 +607,47 @@ impl Document {
     }
 }
 
+/// Rough document-space bounds of a text/vector layer without rendering it.
+fn estimate_bounds(l: &Layer) -> IRect {
+    match &l.kind {
+        LayerKind::Vector(v) => {
+            let [w, h] = v.size;
+            let q = [[0.0, 0.0], [w, 0.0], [w, h], [0.0, h]].map(|p| v.transform.apply(p));
+            let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+            for p in q {
+                (x0, y0, x1, y1) = (x0.min(p[0]), y0.min(p[1]), x1.max(p[0]), y1.max(p[1]));
+            }
+            IRect::from_f32(x0, y0, x1, y1)
+        }
+        LayerKind::Text(t) => {
+            // Generous box around the block (rotation / effects): radius of its diagonal.
+            let lines = t.text.lines().count().max(1) as f32;
+            let cols = t.text.lines().map(|l| l.chars().count()).max().unwrap_or(1) as f32;
+            let r = (cols * t.size * 0.7).hypot(lines * t.size * t.line_height.max(1.0)) + t.size;
+            let p = t.position;
+            IRect::from_f32(p[0] - r, p[1] - r, p[0] + r, p[1] + r)
+        }
+        _ => IRect::EMPTY,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn infinite_content_bounds() {
+        let mut d = Document::infinite("t", 100, 100, Some([1.0; 4]));
+        assert!(d.info.is_infinite());
+        assert!(d.content_bounds(true, None).is_empty());
+        assert_eq!(d.extent(), d.bounds());
+        let id = d.active_layer.unwrap();
+        let g = d.layer_mut(id).unwrap().raster_mut().unwrap();
+        g.set_pixel(-5000, -4000, [1.0; 4]);
+        g.set_pixel(8000, 3000, [1.0; 4]);
+        assert_eq!(d.content_bounds(true, None), IRect::new(-5000, -4000, 8001, 3001));
+        assert_eq!(d.extent(), IRect::new(-5120, -4096, 8192, 3072));
+    }
 
     #[test]
     fn rotate_four_times_is_identity() {

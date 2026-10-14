@@ -54,6 +54,8 @@ pub struct Globals {
     pub mip: u32,
     pub doc_w: f32,
     pub doc_h: f32,
+    /// Infinite canvas: no page edge (filters read transparency past the content).
+    pub infinite: bool,
 }
 
 #[repr(C)]
@@ -67,6 +69,8 @@ struct InfoUniform {
     mip: f32,
     doc_w: f32,
     doc_h: f32,
+    infinite: f32,
+    _pad: [f32; 3],
 }
 
 pub struct Kernels {
@@ -238,6 +242,8 @@ impl Kernels {
             mip: g.mip as f32,
             doc_w: g.doc_w,
             doc_h: g.doc_h,
+            infinite: g.infinite as i32 as f32,
+            _pad: [0.0; 3],
         };
         for (i, inp) in inputs.iter().enumerate() {
             if let Some(img) = inp {

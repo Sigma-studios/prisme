@@ -16,11 +16,13 @@ pub struct NewDoc {
     pub name: String,
     pub fill: u8, // 0 white, 1 black, 2 transparent, 3 background colour
     pub f32: bool,
+    /// Infinite canvas (no page; the size is only the initial frame).
+    pub infinite: bool,
 }
 
 impl Default for NewDoc {
     fn default() -> Self {
-        Self { open: false, w: 1920, h: 1080, name: "Untitled".into(), fill: 0, f32: false }
+        Self { open: false, w: 1920, h: 1080, name: "Untitled".into(), fill: 0, f32: false, infinite: false }
     }
 }
 
@@ -33,6 +35,8 @@ pub struct ExportDialog {
     pub notes: Vec<String>,
     pub target_kb: f32,
     pub opts_snapshot: Option<String>,
+    /// Exporting the selection (Export Selection…) rather than the whole document.
+    pub selection: bool,
 }
 
 #[derive(Default)]
@@ -71,17 +75,27 @@ impl Dialogs {
     }
 }
 
-pub fn open_export(s: &mut AppState) {
+/// Open the PNG export dialog for the whole document, or for the selection's bounds (alpha
+/// applied) when `selection` and there is one. The whole document of an infinite canvas is
+/// its content bounds.
+pub fn open_export(s: &mut AppState, selection: bool) {
     if s.docs.is_empty() {
         return;
     }
+    s.dialogs.export.selection = selection && s.doc().is_some_and(|d| d.doc().selection.is_some());
     s.dialogs.export.open = true;
     s.dialogs.export.pixels = None;
     s.dialogs.export.estimate = None;
     if s.dialogs.export.target_kb <= 0.0 {
         s.dialogs.export.target_kb = 500.0;
     }
-    crate::jobs::start_render(s, false);
+    start_export_render(s);
+}
+
+/// (Re-)render the export dialog's region.
+pub fn start_export_render(s: &mut AppState) {
+    let sel = s.dialogs.export.selection;
+    crate::jobs::start_render(s, sel, crate::jobs::RenderPurpose::Export { then_encode: false });
 }
 
 pub fn show(s: &mut AppState, ctx: &egui::Context) {
@@ -126,6 +140,9 @@ fn new_doc(s: &mut AppState, ctx: &egui::Context) {
             }
         });
         ui.checkbox(&mut nd.f32, "32-bit float storage (HDR / heavy grading)");
+        ui.checkbox(&mut nd.infinite, "Infinite canvas").on_hover_text(
+            "No page: paint anywhere. The size above is only the initial view. Export Selection exports a region; Export exports the content bounds.",
+        );
         ui.add_space(6.0);
         if ui.button("Create").clicked() {
             create = true;
@@ -139,7 +156,7 @@ fn new_doc(s: &mut AppState, ctx: &egui::Context) {
             2 => None,
             _ => Some(s.settings.bg),
         };
-        let mut d = Document::with_background(nd.name.clone(), nd.w, nd.h, fill);
+        let mut d = if nd.infinite { Document::infinite(nd.name.clone(), nd.w, nd.h, fill) } else { Document::with_background(nd.name.clone(), nd.w, nd.h, fill) };
         if nd.f32 {
             d.info.format = prisme_core::PixelFormat::F32;
             for l in &mut d.layers {
@@ -242,7 +259,8 @@ fn export(s: &mut AppState, ctx: &egui::Context) {
     let mut opts = s.settings.export.clone();
     let rendering = s.jobs.iter().any(|j| matches!(j, crate::jobs::Job::Render(_)));
     let encoding = s.jobs.iter().any(|j| matches!(j, crate::jobs::Job::Encode { .. }));
-    Window::new("Export PNG").open(&mut open).collapsible(false).resizable(false).default_width(380.0).show(ctx, |ui| {
+    let title = if s.dialogs.export.selection { "Export Selection" } else { "Export PNG" };
+    Window::new(title).id(egui::Id::new("export-png")).open(&mut open).collapsible(false).resizable(false).default_width(380.0).show(ctx, |ui| {
         egui::Grid::new("png-opts").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
             ui.label("Colour");
             ComboBox::from_id_salt("cm").selected_text(format!("{:?}", opts.color_mode)).show_ui(ui, |ui| {
@@ -394,7 +412,7 @@ fn export(s: &mut AppState, ctx: &egui::Context) {
                 }
             }
             if ui.button("Re-render").on_hover_text("Re-render the image (after edits)").clicked() {
-                crate::jobs::start_render(s, false);
+                start_export_render(s);
             }
         });
     });

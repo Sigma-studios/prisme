@@ -12,6 +12,7 @@ pub enum Action {
     Save,
     SaveAs,
     Export,
+    ExportSelection,
     Close,
     Undo,
     Redo,
@@ -67,7 +68,7 @@ impl Action {
     pub fn all() -> Vec<Action> {
         use Action::*;
         let mut v = vec![
-            New, Open, Save, SaveAs, Export, Close, Undo, Redo, Cut, Copy, CopyMerged, Paste, PasteNewDoc, Delete, FillFg, FillBg,
+            New, Open, Save, SaveAs, Export, ExportSelection, Close, Undo, Redo, Cut, Copy, CopyMerged, Paste, PasteNewDoc, Delete, FillFg, FillBg,
             SelectAll, Deselect, InvertSelection, SaveSelectionMask, NewLayer, DuplicateLayer, DeleteLayer, MergeDown,
             GroupLayer, AddMask, ImageSize, CanvasSize, ZoomIn, ZoomOut, ZoomFit, Zoom100, RotateViewLeft, RotateViewRight,
             ResetView, ToggleNodeOutput, SwapColors, ResetColors, BrushSmaller, BrushBigger, PickScreenColor, Preferences,
@@ -83,7 +84,7 @@ impl Action {
         use Action::*;
         match self {
             Tool(_) | BrushSmaller | BrushBigger => "Tools",
-            New | Open | Save | SaveAs | Export | Close => "File",
+            New | Open | Save | SaveAs | Export | ExportSelection | Close => "File",
             Undo | Redo | Cut | Copy | CopyMerged | Paste | PasteNewDoc | Delete | FillFg | FillBg => "Edit",
             SelectAll | Deselect | InvertSelection | SaveSelectionMask => "Select",
             NewLayer | DuplicateLayer | DeleteLayer | MergeDown | GroupLayer | AddMask => "Layer",

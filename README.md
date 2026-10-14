@@ -63,4 +63,13 @@ WebGPU browser with module-worker support (all current WebGPU browsers have it).
 
 ### Automation
 `PRISME_SCRIPT="open:img.jpg;node:levels;param:m.gamma=1.3;export:out.png;quit"` drives the desktop app for
-end-to-end checks; `tool:Brush;stroke:x0,y0,x1,y1,…` paints (see `crates/prisme-ui/src/script.rs`).
+end-to-end checks; `tool:Brush;stroke:x0,y0,x1,y1,…` paints, `new-infinite:W,H` makes an infinite canvas,
+`export-sel:out.png` / `action:CopyMerged;clip:out.png` export / copy the selection (see `crates/prisme-ui/src/script.rs`).
+
+### Infinite canvas
+New Image ▸ *Infinite canvas* creates a document with no page (`CanvasKind::Infinite`, saved in `.prisme` v2; v1 files
+load as Fixed). Content can live anywhere (sparse i32 tiles); the view, zoom-to-fit, navigator, Select All and Export
+use the content bounds; filters see transparency past the content; Fill / Gradient / bucket act on the selection, else
+the visible viewport; Image Size / Canvas Size / Crop are disabled. Coordinates stay sub-pixel exact to about ±1e6 px.
+**Export Selection…** exports the selection's bounds (graph output, selection alpha); saved masks (Masks panel ▸
+Export) act as reusable boards.

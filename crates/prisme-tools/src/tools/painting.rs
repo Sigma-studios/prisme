@@ -403,7 +403,7 @@ impl Tool for FillTool {
             Err(e) => return ToolOutcome::Message(e),
         };
         let seed = [ev.pos[0].floor() as i32, ev.pos[1].floor() as i32];
-        let bounds = cx.doc.bounds();
+        let bounds = cx.fill_area(true);
         if !bounds.contains(seed[0], seed[1]) {
             return ToolOutcome::None;
         }
@@ -532,7 +532,7 @@ impl Tool for GradientTool {
                     Err(e) => return ToolOutcome::Message(e),
                 };
                 let g = self.gradient(cx);
-                let bounds = cx.doc.bounds();
+                let bounds = cx.fill_area(true);
                 let sel = cx.doc.selection.clone();
                 let opacity = cx.opts.gradient_opacity;
                 if let Some(grid) = target_grid(cx.doc, target) {

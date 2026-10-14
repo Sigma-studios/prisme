@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! magic  "PRISME\0\x01"            8 bytes
-//! version u32                      currently 1
+//! version u32                      currently 2 (1 still read)
 //! count   u32                      number of chunks
 //! TOC     count x { tag [u8;4], offset u64, length u64 }
 //! chunks  in order PREV (optional), DOC, TILE
@@ -26,7 +26,8 @@ use prisme_core::{Document, History, PixelFormat};
 use std::sync::Arc;
 
 const MAGIC: &[u8; 8] = b"PRISME\0\x01";
-const VERSION: u32 = 1;
+/// 2: `DocumentInfo` gained `canvas` (v1 files still load, as Fixed documents).
+const VERSION: u32 = 2;
 const TAG_PREVIEW: [u8; 4] = *b"PREV";
 const TAG_DOC: [u8; 4] = *b"DOC ";
 const TAG_TILES: [u8; 4] = *b"TILE";
@@ -113,7 +114,7 @@ fn assemble(doc: Vec<u8>, tiles: Vec<u8>, preview: Option<(u32, u32, &[u8])>) ->
 
 /// Load a history saved with [`save`] / [`save_with_preview`].
 pub fn load(bytes: &[u8]) -> Result<History, IoError> {
-    let toc = read_toc(bytes)?;
+    let (version, toc) = read_toc(bytes)?;
     let find = |tag: [u8; 4]| toc.iter().find(|(t, _)| *t == tag).map(|(_, d)| *d);
     let doc = find(TAG_DOC).ok_or_else(|| corrupt("missing DOC chunk"))?;
     let tiles = find(TAG_TILES).ok_or_else(|| corrupt("missing TILE chunk"))?;
@@ -125,7 +126,8 @@ pub fn load(bytes: &[u8]) -> Result<History, IoError> {
             self.0.get(index as usize).cloned()
         }
     }
-    let history: History = with_source(Box::new(Source(tiles)), || postcard::from_bytes(doc))
+    let de = || with_source(Box::new(Source(tiles)), || postcard::from_bytes::<History>(doc));
+    let history = if version == 1 { prisme_core::document::with_legacy_info(de) } else { de() }
         .map_err(|e| corrupt(format!("document: {e}")))?;
 
     if history.entries().is_empty() {
@@ -143,7 +145,7 @@ pub fn load(bytes: &[u8]) -> Result<History, IoError> {
 /// Read only the embedded flattened preview (fast path for instant open/thumbnail).
 /// Returns (w, h, sRGB8 RGBA bytes).
 pub fn read_preview(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
-    let toc = read_toc(bytes).ok()?;
+    let (_, toc) = read_toc(bytes).ok()?;
     let p = toc.iter().find(|(t, _)| *t == TAG_PREVIEW)?.1;
     let w = u32::from_le_bytes(p.get(0..4)?.try_into().ok()?);
     let h = u32::from_le_bytes(p.get(4..8)?.try_into().ok()?);
@@ -159,13 +161,13 @@ pub fn read_preview(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
 /// A chunk: tag and payload.
 type Chunk<'a> = ([u8; 4], &'a [u8]);
 
-/// Parse the header and table of contents, returning each chunk's bytes.
-fn read_toc(bytes: &[u8]) -> Result<Vec<Chunk<'_>>, IoError> {
+/// Parse the header and table of contents: (format version, chunks).
+fn read_toc(bytes: &[u8]) -> Result<(u32, Vec<Chunk<'_>>), IoError> {
     if bytes.len() < HEADER_LEN || &bytes[..8] != MAGIC {
         return Err(corrupt("not a Prisme project file"));
     }
     let version = u32::from_le_bytes(bytes[8..12].try_into().expect("4 bytes"));
-    if version != VERSION {
+    if !(1..=VERSION).contains(&version) {
         return Err(IoError::Unsupported(format!("Prisme project version {version} (this build reads {VERSION})")));
     }
     let count = u32::from_le_bytes(bytes[12..16].try_into().expect("4 bytes")) as usize;
@@ -183,7 +185,7 @@ fn read_toc(bytes: &[u8]) -> Result<Vec<Chunk<'_>>, IoError> {
         let end = end.ok_or_else(|| corrupt(format!("chunk {} out of bounds", String::from_utf8_lossy(&tag))))?;
         out.push((tag, &bytes[off as usize..end as usize]));
     }
-    Ok(out)
+    Ok((version, out))
 }
 
 // --------------------------------------------------------------------------------
@@ -507,6 +509,27 @@ mod tests {
         }
         // Shared tiles must stay shared after loading (dedup also in memory).
         assert_eq!(back.memory_bytes(), h.memory_bytes());
+    }
+
+    #[test]
+    fn canvas_kind_roundtrips_and_v1_loads_as_fixed() {
+        let mut d = Document::infinite("inf", 64, 64, None);
+        d.layer_mut(d.active_layer.unwrap()).unwrap().raster_mut().unwrap().set_pixel(-3000, 900, [1.0; 4]);
+        let h = History::new(d);
+        let back = load(&save(&h, true).unwrap()).unwrap();
+        assert!(back.current().info.is_infinite());
+        let t = to_transport(&h).unwrap();
+        let back: History = from_transport(&t.doc, &t.tiles).unwrap();
+        assert!(back.current().info.is_infinite());
+        assert_eq!(back.current().all_layers()[0].raster().unwrap().get_pixel(-3000, 900), [1.0; 4]);
+        // A v1 file: old DocumentInfo layout, version 1 header.
+        let h = random_history(3);
+        let mut v1 = prisme_core::document::with_legacy_info(|| save(&h, true)).unwrap();
+        v1[8..12].copy_from_slice(&1u32.to_le_bytes());
+        let back = load(&v1).unwrap();
+        assert_eq!(back.entries().len(), h.entries().len());
+        assert!(!back.current().info.is_infinite());
+        assert_eq!(raster_layers(back.current()), raster_layers(h.current()));
     }
 
     #[test]

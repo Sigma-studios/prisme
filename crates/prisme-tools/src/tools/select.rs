@@ -255,7 +255,7 @@ impl Tool for RegionTool {
         }
         let op = sel_op(&ev.mods, cx.opts.sel_op);
         let seed = [ev.pos[0].floor() as i32, ev.pos[1].floor() as i32];
-        let bounds = cx.doc.bounds();
+        let bounds = cx.fill_area(false);
         if !bounds.contains(seed[0], seed[1]) {
             return ToolOutcome::None;
         }

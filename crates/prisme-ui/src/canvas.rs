@@ -57,12 +57,12 @@ pub fn canvas_tab(s: &mut AppState, ui: &mut Ui) {
     let center = rect.center();
     let active = s.active;
 
-    // Fit on first show.
+    // Fit on first show (and Fit on Screen): the page, or the content of an infinite canvas.
     {
-        let d = &mut s.docs[active];
-        if !d.view.fitted && d.view.zoom == 1.0 && d.view.pan == [0.0, 0.0] {
-            let (w, h) = (d.doc().info.width, d.doc().info.height);
-            d.view.fit(w, h, rect.size());
+        let v = s.docs[active].view;
+        if !v.fitted && v.zoom == 1.0 && v.pan == [0.0, 0.0] {
+            let r = crate::commands::doc_extent(s, s.docs[active].doc());
+            s.docs[active].view.fit(r, rect.size());
         }
     }
 
@@ -187,7 +187,7 @@ pub fn canvas_tab(s: &mut AppState, ui: &mut Ui) {
             && let Some(w) = d.working.as_mut() {
                 let mut ops = vec![];
                 let gpu = s.gpu.as_mut();
-                let mut cx = ToolCx { doc: w, opts: &opts, fg, bg, strokes: gpu.is_some().then_some(&mut ops) };
+                let mut cx = ToolCx { doc: w, opts: &opts, fg, bg, strokes: gpu.is_some().then_some(&mut ops), view: d.view_rect };
                 let out = t.tick(&mut cx, time);
                 if let Some(g) = gpu {
                     crate::stroke::feed(d, &mut g.engine, ops);
@@ -268,7 +268,11 @@ pub fn run_tool(s: &mut AppState, ev: ToolInput) {
     let fg = s.settings.fg;
     let bg = s.settings.bg;
     let opts = s.settings.tools.clone();
-    if s.doc().is_none() {
+    let Some(doc) = s.doc() else { return };
+    if tool_kind == ToolKind::Crop && doc.doc().info.is_infinite() {
+        if ev.phase == Phase::Down {
+            s.toast("Crop needs a fixed-size canvas (this one is infinite): use Export Selection");
+        }
         return;
     }
     let Some(d) = s.docs.get_mut(s.active) else { return };
@@ -284,7 +288,7 @@ pub fn run_tool(s: &mut AppState, ev: ToolInput) {
     let mut ops = vec![];
     let gpu = s.gpu.as_mut();
     let outcome = {
-        let mut cx = ToolCx { doc: d.working.as_mut().unwrap(), opts: &opts, fg, bg, strokes: gpu.is_some().then_some(&mut ops) };
+        let mut cx = ToolCx { doc: d.working.as_mut().unwrap(), opts: &opts, fg, bg, strokes: gpu.is_some().then_some(&mut ops), view: d.view_rect };
         tool.input(&mut cx, &ev)
     };
     if let Some(g) = gpu {
@@ -340,7 +344,7 @@ fn sample_color(s: &mut AppState, pos: [f32; 2], raw: bool, to_bg: bool) {
     let Some(d) = s.doc() else { return };
     let doc = d.doc();
     let (x, y) = (pos[0].floor() as i32, pos[1].floor() as i32);
-    if !doc.bounds().contains(x, y) {
+    if !doc.info.is_infinite() && !doc.bounds().contains(x, y) {
         return;
     }
     if raw {
@@ -390,11 +394,9 @@ fn render(s: &mut AppState, ctx: &egui::Context, rect: Rect, ppp: f32, painter: 
     };
     let d = &mut s.docs[active];
     let doc = d.working.as_ref().unwrap_or_else(|| d.history.current());
-    let (w, h) = (doc.info.width as i32, doc.info.height as i32);
+    let infinite = doc.info.is_infinite();
     let center = rect.center();
     let zoom_px = d.view.zoom * ppp;
-    let max_mip = ((w.max(h) as f32).log2().floor() as u32).saturating_sub(4);
-    let mip = if zoom_px >= 1.0 { 0 } else { ((1.0 / zoom_px).log2().floor() as u32).min(max_mip).min(10) };
     let corners = [rect.left_top(), rect.right_top(), rect.right_bottom(), rect.left_bottom()].map(|p| d.view.screen_to_doc(center, p));
     let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
     for c in corners {
@@ -403,14 +405,22 @@ fn render(s: &mut AppState, ctx: &egui::Context, rect: Rect, ppp: f32, painter: 
         x1 = x1.max(c[0]);
         y1 = y1.max(c[1]);
     }
-    let visible = IRect::from_f32(x0, y0, x1, y1).intersect(&IRect::new(0, 0, w, h));
+    let view_r = IRect::from_f32(x0, y0, x1, y1);
+    d.view_rect = view_r;
+    // Infinite canvas: no page, the evaluated area is just the view.
+    let page = if infinite { view_r } else { doc.bounds() };
+    let (w, h) = (page.width(), page.height());
+    let max_mip = ((w.max(h) as f32).log2().floor() as u32).saturating_sub(4);
+    let mip = if zoom_px >= 1.0 { 0 } else { ((1.0 / zoom_px).log2().floor() as u32).min(max_mip).min(10) };
+    let visible = view_r.intersect(&page);
     if visible.is_empty() {
         return;
     }
     let k = 1i32 << mip;
-    let level_doc = IRect::new(0, 0, (w + k - 1) / k, (h + k - 1) / k);
-    let need = IRect::new(visible.x0.div_euclid(k), visible.y0.div_euclid(k), (visible.x1 + k - 1).div_euclid(k), (visible.y1 + k - 1).div_euclid(k))
-        .intersect(&level_doc);
+    let level = |r: IRect| IRect::new(r.x0.div_euclid(k), r.y0.div_euclid(k), (r.x1 + k - 1).div_euclid(k), (r.y1 + k - 1).div_euclid(k));
+    let level_doc = level(page);
+    let clip = |r: IRect| if infinite { r } else { r.intersect(&level_doc) };
+    let need = clip(level(visible));
     // Editing a saved mask: show it as a red quick-mask overlay on top of the output.
     let overlay = editing_mask.and_then(|mid| crate::panels::masks::overlay_doc(doc, mid, d.show_nodes));
     let doc = overlay.as_ref().unwrap_or(doc);
@@ -433,8 +443,7 @@ fn render(s: &mut AppState, ctx: &egui::Context, rect: Rect, ppp: f32, painter: 
     if !reuse {
         // Evaluate a tile-aligned rect with one tile of margin to absorb small pans.
         let ts = 256;
-        let eval = IRect::new(need.x0.div_euclid(ts) * ts - ts, need.y0.div_euclid(ts) * ts - ts, (need.x1 + ts - 1).div_euclid(ts) * ts + ts, (need.y1 + ts - 1).div_euclid(ts) * ts + ts)
-            .intersect(&level_doc);
+        let eval = clip(IRect::new(need.x0.div_euclid(ts) * ts - ts, need.y0.div_euclid(ts) * ts - ts, (need.x1 + ts - 1).div_euclid(ts) * ts + ts, (need.y1 + ts - 1).div_euclid(ts) * ts + ts));
         let max = g.engine.ctx.max_texture_size() as i32;
         let eval = if eval.width() > max || eval.height() > max { need } else { eval };
         let img = g.engine.evaluate_with(&EvalRequest { doc, rect: eval, mip, format: EvalFormat::F16, source }, d.stroke.as_ref().map(|st| &st.gpu));
@@ -463,7 +472,7 @@ fn render(s: &mut AppState, ctx: &egui::Context, rect: Rect, ppp: f32, painter: 
         fb_to_doc: d.view.fb_to_doc(center, ppp),
         level_scale: 1.0 / k as f32,
         nearest: zoom_px >= 2.0,
-        doc_size: [w as f32, h as f32],
+        doc_size: if infinite { [-1.0; 2] } else { [w as f32, h as f32] },
         checker_px: 8.0 * ppp,
         display_space: prisme_color::RgbSpace::Srgb,
         exposure: 0.0,
@@ -510,15 +519,18 @@ fn overlays(s: &mut AppState, ctx: &egui::Context, rect: Rect, painter: &egui::P
     let view = d.view;
     let to_s = |p: [f32; 2]| view.doc_to_screen(center, p);
     let doc = d.working.as_ref().unwrap_or_else(|| d.history.current());
-    // Document border.
-    let (w, h) = (doc.info.width as f32, doc.info.height as f32);
-    painter.add(Shape::closed_line(vec![to_s([0.0, 0.0]), to_s([w, 0.0]), to_s([w, h]), to_s([0.0, h])], Stroke::new(1.0, Color32::from_black_alpha(160))));
+    // Document border (an infinite canvas has no page).
+    if !doc.info.is_infinite() {
+        let (w, h) = (doc.info.width as f32, doc.info.height as f32);
+        painter.add(Shape::closed_line(vec![to_s([0.0, 0.0]), to_s([w, 0.0]), to_s([w, h]), to_s([0.0, h])], Stroke::new(1.0, Color32::from_black_alpha(160))));
+    }
 
     // Selection marching ants.
     if let Some(sel) = &doc.selection {
         let key = crate::outline::grid_key(sel);
         if d.outline.as_ref().map(|o| o.0) != Some(key) {
-            d.outline = Some((key, crate::outline::contours(sel, doc.bounds())));
+            let b = if doc.info.is_infinite() { sel.tile_bounds() } else { doc.bounds() };
+            d.outline = Some((key, crate::outline::contours(sel, b)));
         }
         let offset = (time * 16.0) as f32 % 8.0;
         if let Some((_, lines)) = &d.outline {

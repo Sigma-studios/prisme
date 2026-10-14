@@ -41,6 +41,7 @@ pub struct DisplayParams {
     pub fb_to_doc: Affine2,
     pub level_scale: f32,
     pub nearest: bool,
+    /// Page size; negative = no page (infinite canvas: the checkerboard fills the view).
     pub doc_size: [f32; 2],
     pub checker_px: f32,
     /// Target space used when no display LUT is loaded.

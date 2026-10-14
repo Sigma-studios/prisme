@@ -43,10 +43,12 @@ impl View {
             .mul(&Affine2::translate(-center.x * ppp, -center.y * ppp))
     }
 
-    pub fn fit(&mut self, doc_w: u32, doc_h: u32, area: egui::Vec2) {
-        let z = ((area.x - 40.0) / doc_w as f32).min((area.y - 40.0) / doc_h as f32);
+    /// Fit document rect `r` (the page, or content bounds on an infinite canvas) in `area`.
+    pub fn fit(&mut self, r: prisme_core::IRect, area: egui::Vec2) {
+        let (w, h) = (r.width().max(1) as f32, r.height().max(1) as f32);
+        let z = ((area.x - 40.0) / w).min((area.y - 40.0) / h);
         self.zoom = z.clamp(0.01, 64.0);
-        self.pan = [doc_w as f32 * 0.5, doc_h as f32 * 0.5];
+        self.pan = [r.x0 as f32 + w * 0.5, r.y0 as f32 + h * 0.5];
         self.rotation = 0.0;
         self.fitted = true;
     }
@@ -91,6 +93,9 @@ pub struct DocState {
     pub outline: Option<(u64, Vec<Vec<[f32; 2]>>)>,
     /// GPU brush stroke being painted or waiting to land (see `crate::stroke`).
     pub stroke: Option<crate::stroke::DocStroke>,
+    /// Document-space rect visible on the canvas at the last frame (area fills on infinite
+    /// canvases).
+    pub view_rect: prisme_core::IRect,
 }
 
 static NEXT_DOC_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -114,6 +119,7 @@ impl DocState {
             placeholder: None,
             outline: None,
             stroke: None,
+            view_rect: prisme_core::IRect::EMPTY,
         }
     }
 

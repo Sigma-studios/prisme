@@ -163,7 +163,7 @@ impl Engine {
             doc: req.doc,
             mip: req.mip,
             format: req.format,
-            g: Globals { level_scale, mip: req.mip, doc_w: req.doc.info.width as f32, doc_h: req.doc.info.height as f32 },
+            g: Globals { level_scale, mip: req.mip, doc_w: req.doc.info.width as f32, doc_h: req.doc.info.height as f32, infinite: req.doc.info.is_infinite() },
             enc,
             layer_hashes: HashMap::new(),
             node_hashes: HashMap::new(),
@@ -244,19 +244,21 @@ impl Engine {
         Some(result)
     }
 
-    /// Evaluate a node at a small size and convert to sRGB8 (node editor thumbnails).
+    /// Evaluate a node over [`Document::extent`] at a small size and convert to sRGB8
+    /// (navigator, node editor thumbnails).
     pub fn thumbnail(&mut self, doc: &Document, node: NodeId, max_side: u32) -> Option<GpuImage> {
-        let side = doc.info.width.max(doc.info.height).max(1);
+        let ext = doc.extent();
+        let side = ext.width().max(ext.height()).max(1) as u32;
         let mut mip = 0;
         while (side >> mip) > max_side * 2 && mip < 12 {
             mip += 1;
         }
         let s = 1 << mip;
-        let rect = IRect::new(0, 0, (doc.info.width as i32 + s - 1) / s, (doc.info.height as i32 + s - 1) / s);
+        let rect = IRect::new(ext.x0.div_euclid(s), ext.y0.div_euclid(s), (ext.x1 + s - 1).div_euclid(s), (ext.y1 + s - 1).div_euclid(s));
         let img = self.evaluate(&EvalRequest { doc, rect, mip, format: EvalFormat::F16, source: RenderSource::Node(node) })?;
         let mut enc = self.ctx.device.create_command_encoder(&Default::default());
         let out = self.pool.image(rect, wgpu::TextureFormat::Rgba8Unorm);
-        let g = Globals { level_scale: 1.0 / s as f32, mip, doc_w: doc.info.width as f32, doc_h: doc.info.height as f32 };
+        let g = Globals { level_scale: 1.0 / s as f32, mip, doc_w: doc.info.width as f32, doc_h: doc.info.height as f32, infinite: doc.info.is_infinite() };
         self.kernels.dispatch(&mut enc, "k_thumb", &out, None, [Some(&img), None, None, None], &[], None, &g);
         self.ctx.queue.submit([enc.finish()]);
         Some(out)
@@ -304,6 +306,7 @@ impl Engine {
         f.format.hash(&mut h);
         f.doc.info.width.hash(&mut h);
         f.doc.info.height.hash(&mut h);
+        f.doc.info.canvas.hash(&mut h);
         let mut ins: Vec<_> = graph.links.iter().filter(|l| l.to == id).copied().collect();
         ins.sort_by_key(|l| l.to_in);
         for l in ins {
@@ -751,8 +754,17 @@ impl Engine {
                     x1 = x1.max(p[0]);
                     y1 = y1.max(p[1]);
                 }
-                let doc_level = IRect::new(0, 0, (f.g.doc_w * s).ceil() as i32, (f.g.doc_h * s).ceil() as i32).expand(2);
-                let in_rect = IRect::from_f32(x0, y0, x1, y1).expand(2).intersect(&doc_level);
+                let in_rect = IRect::from_f32(x0, y0, x1, y1).expand(2);
+                // Fixed: nothing exists past the page. Infinite: rotation/scale centre is the
+                // nominal frame's (stable while painting, unlike the content bounds).
+                // Strong zoom-out on an infinite canvas: bound the input by the content.
+                let in_rect = if f.g.infinite && in_rect.width().max(in_rect.height()) > 8192 {
+                    let e = f.doc.content_bounds(false, None).union(&f.doc.bounds());
+                    in_rect.intersect(&IRect::from_f32(e.x0 as f32 * s, e.y0 as f32 * s, e.x1 as f32 * s, e.y1 as f32 * s).expand(2))
+                } else {
+                    in_rect
+                };
+                let in_rect = if f.g.infinite { in_rect } else { in_rect.intersect(&IRect::new(0, 0, (f.g.doc_w * s).ceil() as i32, (f.g.doc_h * s).ceil() as i32).expand(2)) };
                 let out = self.new_image(f, rect);
                 let src = if in_rect.is_empty() { None } else { self.input(f, n, 0, in_rect, SocketType::Image) };
                 let m = inv.m;

@@ -17,7 +17,7 @@ pub mod layer;
 pub mod mask;
 pub mod tile;
 
-pub use document::{Document, DocumentInfo};
+pub use document::{CanvasKind, Document, DocumentInfo};
 pub use geom::IRect;
 pub use gradient::{Gradient, GradientInterp, GradientKind, GradientStop};
 pub use graph::{Graph, Link, Node, ParamValue};

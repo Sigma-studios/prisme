@@ -80,7 +80,9 @@ pub fn ui(s: &mut AppState, ui: &mut Ui) {
                 .color(theme::TEXT_DIM),
         );
     }
-    let bounds = d.doc().bounds();
+    // Infinite canvas: invert within the content and the mask itself.
+    let (bounds, infinite) = (d.doc().extent(), d.doc().info.is_infinite());
+    let mut export = None;
     for m in masks {
         let is_editing = editing == Some(m.id);
         egui::Frame::new().fill(if is_editing { theme::BG3 } else { theme::BG2 }).corner_radius(5).inner_margin(5).show(ui, |ui| {
@@ -119,6 +121,9 @@ pub fn ui(s: &mut AppState, ui: &mut Ui) {
                         doc.selection = Some(Arc::new(grid));
                     });
                 }
+                if ui.small_button(format!("{} Export", ph::EXPORT)).on_hover_text("Load as the selection and export it (Export Selection…): saved masks work as reusable boards").clicked() {
+                    export = Some(m.mask.clone());
+                }
                 if ui
                     .small_button("→ Layer mask")
                     .on_hover_text("Attach to the selected layer as its mask: white areas stay visible, black areas become transparent (non-destructive)")
@@ -138,7 +143,7 @@ pub fn ui(s: &mut AppState, ui: &mut Ui) {
                     });
                 }
                 if ui.small_button("Invert").clicked() {
-                    edit_grid(d, m.id, "Invert Mask", &|g, _| prisme_core::mask::invert(Some(g), bounds));
+                    edit_grid(d, m.id, "Invert Mask", &|g, _| prisme_core::mask::invert(Some(g), if infinite { bounds.union(&g.tile_bounds()) } else { bounds }));
                 }
                 if ui.add_enabled(has_sel, egui::Button::new("+ Sel").small()).on_hover_text("Add the current selection to this mask").clicked() {
                     edit_grid(d, m.id, "Add Selection to Mask", &|g, s| prisme_core::mask::combine(Some(g), s.unwrap(), SelectionOp::Add));
@@ -157,6 +162,10 @@ pub fn ui(s: &mut AppState, ui: &mut Ui) {
     }
     if let Some(e) = start_edit {
         set_editing(s, e);
+    }
+    if let Some(m) = export {
+        crate::commands::edit(s, "Load Mask", |doc| doc.selection = Some(m));
+        crate::dialogs::open_export(s, true);
     }
 }
 

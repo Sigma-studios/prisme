@@ -112,7 +112,7 @@ fn tool_key(s: &mut AppState, key: &ToolKey) -> bool {
         d.working = Some(d.history.current().clone());
     }
     let out = {
-        let mut cx = ToolCx { doc: d.working.as_mut().unwrap(), opts: &opts, fg, bg, strokes: None };
+        let mut cx = ToolCx { doc: d.working.as_mut().unwrap(), opts: &opts, fg, bg, strokes: None, view: d.view_rect };
         tool.key(&mut cx, key)
     };
     let busy = tool.busy();
@@ -135,7 +135,8 @@ pub fn run_action(s: &mut AppState, a: Action, ctx: &egui::Context) {
         Action::Open => crate::jobs::open_dialog(s),
         Action::Save => crate::jobs::save(s, false),
         Action::SaveAs => crate::jobs::save(s, true),
-        Action::Export => crate::dialogs::open_export(s),
+        Action::Export => crate::dialogs::open_export(s, false),
+        Action::ExportSelection => crate::dialogs::open_export(s, true),
         Action::Close if s.dialogs.shortcuts.focused => crate::shortcuts::close(s),
         Action::Close => {
             let i = s.active;
@@ -154,23 +155,33 @@ pub fn run_action(s: &mut AppState, a: Action, ctx: &egui::Context) {
             reset_tools(s);
         }
         Action::Cut => {
-            copy(s, false);
+            copy(s);
             clear_selection_pixels(s, "Cut");
         }
-        Action::Copy => copy(s, false),
-        Action::CopyMerged => copy(s, true),
+        Action::Copy => copy(s),
+        Action::CopyMerged => copy_merged(s),
         Action::Paste => paste(s, false),
         Action::PasteNewDoc => paste(s, true),
         Action::Delete => clear_selection_pixels(s, "Clear"),
         Action::FillFg => fill_selection(s, false),
         Action::FillBg => fill_selection(s, true),
-        Action::SelectAll => edit(s, "Select All", |d| d.selection = Some(Arc::new(prisme_core::mask::select_all(d.bounds())))),
+        // Infinite canvas: "all" = the content bounds (the selection's too when inverting).
+        Action::SelectAll => {
+            let Some(b) = s.doc().map(|d| doc_extent(s, d.doc())) else { return };
+            edit(s, "Select All", |d| d.selection = Some(Arc::new(prisme_core::mask::select_all(b))));
+        }
         Action::Deselect => edit(s, "Deselect", |d| d.selection = None),
-        Action::InvertSelection => edit(s, "Invert Selection", |d| {
-            let b = d.bounds();
-            let inv = prisme_core::mask::invert(d.selection.as_deref(), b);
-            d.selection = Some(Arc::new(inv));
-        }),
+        Action::InvertSelection => {
+            let Some(b) = s.doc().map(|d| doc_extent(s, d.doc())) else { return };
+            edit(s, "Invert Selection", |d| {
+                let b = match &d.selection {
+                    Some(sel) if d.info.is_infinite() => b.union(&sel.content_bounds()),
+                    _ => b,
+                };
+                let inv = prisme_core::mask::invert(d.selection.as_deref(), b);
+                d.selection = Some(Arc::new(inv));
+            })
+        }
         Action::SaveSelectionMask => {
             if let Some(d) = s.doc_mut() {
                 save_selection_mask(d);
@@ -182,6 +193,7 @@ pub fn run_action(s: &mut AppState, a: Action, ctx: &egui::Context) {
         Action::MergeDown => merge_down(s),
         Action::GroupLayer => group_layer(s),
         Action::AddMask => add_mask(s, true),
+        Action::ImageSize | Action::CanvasSize if s.doc().is_some_and(|d| d.doc().info.is_infinite()) => s.toast(FIXED_ONLY),
         Action::ImageSize => s.dialogs.open_image_size(s.docs.get(s.active)),
         Action::CanvasSize => s.dialogs.open_canvas_size(s.docs.get(s.active)),
         Action::ZoomIn | Action::ZoomOut => {
@@ -243,6 +255,21 @@ pub fn run_action(s: &mut AppState, a: Action, ctx: &egui::Context) {
         Action::Preferences => s.dialogs.prefs_open = true,
         Action::Tool(t) => s.set_tool(t),
     }
+}
+
+/// Why page operations (Image/Canvas Size, Crop) are unavailable on infinite canvases.
+pub const FIXED_ONLY: &str = "Not available on an infinite canvas (no page size): select a region and use Export Selection";
+
+/// The finite area standing for the whole document: the page (Fixed), else the exact content
+/// bounds (text/vector measured by the rasterizer), or the nominal frame when empty.
+pub fn doc_extent(s: &AppState, doc: &Document) -> IRect {
+    if !doc.info.is_infinite() {
+        return doc.bounds();
+    }
+    let r = s.rasterizer.clone();
+    let other = move |l: &Layer| r.layer_bounds(l);
+    let c = doc.content_bounds(true, Some(&other));
+    if c.is_empty() { doc.bounds() } else { c }
 }
 
 fn reset_tools(s: &mut AppState) {
@@ -383,7 +410,11 @@ pub fn rasterize(s: &AppState, d: &Document, l: &Layer, apply_props: bool) -> Ti
         LayerKind::Vector(v) => s.rasterizer.vector.rasterize(v, 0).unwrap_or_else(|| TileGrid::rgba(fmt)),
         LayerKind::Fill(f) => {
             let mut g = TileGrid::rgba(fmt);
-            let b = d.bounds();
+            // Unbounded on an infinite canvas: rasterize over the content (and selection).
+            let b = match &d.selection {
+                Some(sel) if d.info.is_infinite() => doc_extent(s, d).union(&sel.content_bounds()),
+                _ => doc_extent(s, d),
+            };
             match &f.content {
                 FillContent::Solid(c) => g.map_rect(&b, |_, _, p| p.copy_from_slice(c)),
                 FillContent::Gradient(gr, geo) => prisme_tools::paint::draw_gradient(&mut g, b, gr, geo, 1.0, None),
@@ -541,8 +572,10 @@ fn clear_selection_pixels(s: &mut AppState, label: &str) {
 
 fn fill_selection(s: &mut AppState, bg: bool) {
     let c = if bg { s.settings.bg } else { s.settings.fg };
+    // Infinite canvas without a selection: fill what's visible (see `ToolCx::fill_area`).
+    let view = s.doc().map(|d| d.view_rect).unwrap_or_default();
     edit(s, "Fill", |d| {
-        let b = d.bounds();
+        let b = if d.info.is_infinite() { view } else { d.bounds() };
         let sel = d.selection.clone().unwrap_or_else(|| Arc::new(prisme_core::mask::select_all(b)));
         if let Some(g) = d.active_mut().and_then(|l| l.raster_mut()) {
             prisme_tools::paint::fill_region(g, &sel, c, 1.0, None);
@@ -551,6 +584,10 @@ fn fill_selection(s: &mut AppState, bg: bool) {
 }
 
 pub fn crop_to_selection(s: &mut AppState) {
+    if s.doc().is_some_and(|d| d.doc().info.is_infinite()) {
+        s.toast(FIXED_ONLY);
+        return;
+    }
     edit(s, "Crop to Selection", |d| {
         if let Some(sel) = &d.selection {
             let b = sel.content_bounds().intersect(&d.bounds());
@@ -586,35 +623,33 @@ fn to_srgb8(px: &[f32]) -> Vec<u8> {
         .collect()
 }
 
-fn copy(s: &mut AppState, merged: bool) {
+/// Copy the active layer's own pixels (selection applied).
+fn copy(s: &mut AppState) {
     let Some(d) = s.doc() else { return };
     let doc = d.doc().clone();
-    let src = if merged {
-        let mut acc = TileGrid::rgba(doc.effective_format());
-        for l in &doc.layers {
-            if l.visible {
-                acc = merge_over(&acc, &rasterize(s, &doc, l, true));
-            }
-        }
-        acc
-    } else {
-        match doc.active() {
-            Some(l) => rasterize(s, &doc, l, false),
-            None => return,
-        }
-    };
+    let Some(l) = doc.active() else { return };
+    let src = rasterize(s, &doc, l, false);
+    let page = |r: IRect| if doc.info.is_infinite() { r } else { r.intersect(&doc.bounds()) };
     let (grid, bounds) = match &doc.selection {
-        Some(sel) => {
-            let (f, _) = split_by_selection(&src, sel);
-            let b = sel.content_bounds().intersect(&doc.bounds());
-            (f, b)
-        }
-        None => (src.clone(), src.content_bounds().intersect(&doc.bounds())),
+        Some(sel) => (split_by_selection(&src, sel).0, page(sel.content_bounds())),
+        None => (src.clone(), page(src.content_bounds())),
     };
     if bounds.is_empty() {
         s.toast("Nothing to copy");
         return;
     }
+    set_clipboard(s, grid, bounds);
+}
+
+/// Copy Merged copies what you see: the GPU renders the graph output (the layer stack when the
+/// graph is trivial, like export) at full resolution in f32 over the selection's bounds (its
+/// alpha applied) or the whole document; `jobs` finishes it when the readbacks land.
+fn copy_merged(s: &mut AppState) {
+    crate::jobs::start_render(s, true, crate::jobs::RenderPurpose::CopyMerged);
+}
+
+/// Put `grid` over `bounds` on the internal clipboard (full precision) and the system one (sRGB8).
+pub fn set_clipboard(s: &mut AppState, grid: TileGrid, bounds: IRect) {
     let px = grid.read_rect(&bounds);
     let img = prisme_platform::ClipboardImage { width: bounds.width() as u32, height: bounds.height() as u32, rgba: to_srgb8(&px) };
     s.clipboard = Some((grid, bounds));
@@ -636,13 +671,20 @@ pub fn paste_grid(s: &mut AppState, grid: TileGrid, bounds: IRect, new_doc: bool
         s.add_doc(DocState::new(d));
         return;
     }
+    let view = s.doc().map(|d| d.view_rect).unwrap_or_default();
     edit(s, "Paste", |d| {
         let id = d.alloc_layer_id();
         let mut g = grid;
-        // Keep the original position if it lies inside the canvas, else centre it.
-        if bounds.intersect(&d.bounds()).is_empty() || bounds.x0 == 0 && bounds.y0 == 0 && (bounds.width() as u32) < d.info.width {
-            let dx = (d.info.width as i32 - bounds.width()) / 2 - bounds.x0;
-            let dy = (d.info.height as i32 - bounds.height()) / 2 - bounds.y0;
+        // Keep the original position if it lies inside the canvas (infinite: the view), else
+        // centre it there. External images come at the origin.
+        let (area, outside) = if d.info.is_infinite() {
+            (view, bounds.intersect(&view).is_empty() || bounds.x0 == 0 && bounds.y0 == 0)
+        } else {
+            (d.bounds(), bounds.intersect(&d.bounds()).is_empty() || bounds.x0 == 0 && bounds.y0 == 0 && (bounds.width() as u32) < d.info.width)
+        };
+        if outside {
+            let dx = area.x0 + (area.width() - bounds.width()) / 2 - bounds.x0;
+            let dy = area.y0 + (area.height() - bounds.height()) / 2 - bounds.y0;
             g = prisme_tools::transform::translate(&g, dx, dy);
         }
         let above = d.active_layer;
@@ -676,7 +718,7 @@ pub fn menu_bar(s: &mut AppState, ui: &mut Ui, dock: &mut DockState<Tab>) {
                 ui.close();
             }
             ui.separator();
-            for (l, a) in [("Save", Action::Save), ("Save As…", Action::SaveAs), ("Export PNG…", Action::Export), ("Close", Action::Close)] {
+            for (l, a) in [("Save", Action::Save), ("Save As…", Action::SaveAs), ("Export PNG…", Action::Export), ("Export Selection…", Action::ExportSelection), ("Close", Action::Close)] {
                 if item(ui, s, l, a) {
                     run = Some(a);
                 }
@@ -723,11 +765,12 @@ pub fn menu_bar(s: &mut AppState, ui: &mut Ui, dock: &mut DockState<Tab>) {
     });
     ui.menu_button("Image", |ui| {
         ui.add_enabled_ui(has_doc, |ui| {
-            if item(ui, s, "Image Size…", Action::ImageSize) {
-                run = Some(Action::ImageSize);
-            }
-            if item(ui, s, "Canvas Size…", Action::CanvasSize) {
-                run = Some(Action::CanvasSize);
+            let fixed = !s.doc().is_some_and(|d| d.doc().info.is_infinite());
+            for (l, a) in [("Image Size…", Action::ImageSize), ("Canvas Size…", Action::CanvasSize)] {
+                let sc = s.settings.keymap.label(ui.ctx(), a);
+                if ui.add_enabled(fixed, egui::Button::new(l).shortcut_text(sc)).on_disabled_hover_text(FIXED_ONLY).clicked() {
+                    run = Some(a);
+                }
             }
             ui.separator();
             for (l, op) in [("Rotate 90° CW", 0u8), ("Rotate 180°", 1), ("Rotate 90° CCW", 2), ("Flip Horizontal", 3), ("Flip Vertical", 4)] {
@@ -737,7 +780,7 @@ pub fn menu_bar(s: &mut AppState, ui: &mut Ui, dock: &mut DockState<Tab>) {
                 }
             }
             ui.separator();
-            if ui.button("Crop to Selection").clicked() {
+            if ui.add_enabled(fixed, egui::Button::new("Crop to Selection")).on_disabled_hover_text(FIXED_ONLY).clicked() {
                 crop_to_selection(s);
                 ui.close();
             }

@@ -55,7 +55,8 @@ pub fn ui(s: &mut AppState, ui: &mut Ui) {
         }
         ui.separator();
         super::section(ui, "Document");
-        ui.label(format!("{} × {} px  ·  {} layers", doc.info.width, doc.info.height, doc.all_layers().len()));
+        let size = if doc.info.is_infinite() { "Infinite canvas".to_string() } else { format!("{} × {} px", doc.info.width, doc.info.height) };
+        ui.label(format!("{size}  ·  {} layers", doc.all_layers().len()));
         if let Some(p) = &doc.info.source_profile {
             ui.label(RichText::new(format!("Source colour: {p}")).small().color(theme::TEXT_DIM));
         }

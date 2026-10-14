@@ -524,7 +524,8 @@ fn status_bar(s: &mut AppState, ui: &mut Ui) {
     ui.horizontal_centered(|ui| {
         if let Some(d) = s.doc() {
             let doc = d.doc();
-            ui.label(RichText::new(format!("{} × {} px", doc.info.width, doc.info.height)).color(theme::TEXT_DIM));
+            let size = if doc.info.is_infinite() { "Infinite".to_string() } else { format!("{} × {} px", doc.info.width, doc.info.height) };
+            ui.label(RichText::new(size).color(theme::TEXT_DIM));
             ui.separator();
             ui.label(RichText::new(format!("{:.0}%", d.view.zoom * 100.0)).color(theme::TEXT_DIM));
             ui.separator();

@@ -161,3 +161,53 @@ fn blur_extends_edges_by_default() {
     let px = eval(&mut engine, &doc, doc.bounds(), 0, RenderSource::Graph);
     assert!(px[3] < 0.6, "transparent edges should fade, got {}", px[3]);
 }
+
+/// Infinite canvas: content far from the origin renders, filters read transparency past the
+/// content (no page edge to extend), and a region rendered in tiles (export / Copy Merged
+/// jobs) equals the one-shot render, with the graph (Levels) and blend modes applied.
+#[test]
+fn infinite_canvas_far_content() {
+    let Some(ctx) = ctx() else { return };
+    let mut engine = Engine::new(ctx);
+    let mut doc = Document::infinite("t", 300, 200, None);
+    let id = doc.active_layer.unwrap();
+    doc.layer_mut(id).unwrap().raster_mut().unwrap().map_rect(&IRect::new(-5000, -5000, -4900, -4900), |_, _, p| p.copy_from_slice(&[0.8, 0.3, 0.1, 1.0]));
+    let top = doc.alloc_layer_id();
+    let mut g = TileGrid::rgba(PixelFormat::F32);
+    g.map_rect(&IRect::new(-4950, -4950, -4850, -4850), |_, _, p| p.copy_from_slice(&[0.2, 0.6, 0.9, 0.7]));
+    let mut l = Layer::new(top, "top", LayerKind::Raster(Arc::new(g)));
+    l.blend = BlendMode::Multiply;
+    doc.layers.push(l);
+    let stack = doc.graph.input(doc.graph.output, 0).unwrap().0;
+    let mut p = prisme_graph::default_params("gaussian_blur");
+    p.insert("radius".into(), ParamValue::Float(8.0));
+    let blur = doc.graph.add_node("gaussian_blur", p, [0.0; 2]);
+    let mut p = prisme_graph::default_params("levels");
+    p.insert("m.gamma".into(), ParamValue::Float(1.6));
+    let lv = doc.graph.add_node("levels", p, [0.0; 2]);
+    doc.graph.connect(stack, 0, blur, 0);
+    doc.graph.connect(blur, 0, lv, 0);
+    doc.graph.connect(lv, 0, doc.graph.output, 0);
+    let rect = IRect::new(-5040, -5040, -4800, -4800);
+    let whole = eval(&mut engine, &doc, rect, 0, RenderSource::Graph);
+    let at = |px: &[f32], x: i32, y: i32| { let i = (((y - rect.y0) * rect.width() + x - rect.x0) * 4) as usize; px[i + 3] };
+    assert!(at(&whole, -4980, -4980) > 0.99, "content renders far from the origin");
+    assert!(at(&whole, -5030, -4980) < 1e-4, "no edge extension past the content");
+    assert!(at(&whole, -5000, -4980) > 0.3 && at(&whole, -5000, -4980) < 0.7, "blur fades into transparency");
+    // Tiled render (the export / Copy Merged path) == one-shot render.
+    let mut tiled = vec![0.0f32; whole.len()];
+    let w = rect.width() as usize;
+    for t in [IRect::new(-5040, -5040, -4900, -4800), IRect::new(-4900, -5040, -4800, -4800)] {
+        let px = eval(&mut engine, &doc, t, 0, RenderSource::Graph);
+        let tw = t.width() as usize;
+        for y in 0..t.height() as usize {
+            let d = ((t.y0 - rect.y0) as usize + y) * w + (t.x0 - rect.x0) as usize;
+            tiled[d * 4..(d + tw) * 4].copy_from_slice(&px[y * tw * 4..(y + 1) * tw * 4]);
+        }
+    }
+    let max_diff = whole.iter().zip(&tiled).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    assert!(max_diff < 1e-5, "tiled render differs by {max_diff}");
+    // The graph is applied (differs from the raw layer stack).
+    let raw = eval(&mut engine, &doc, rect, 0, RenderSource::LayerStack);
+    assert!(whole.iter().zip(&raw).any(|(a, b)| (a - b).abs() > 0.01));
+}

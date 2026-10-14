@@ -1,4 +1,5 @@
-//! Navigator: whole-document thumbnail with the visible area; click/drag to pan.
+//! Navigator: whole-document thumbnail with the visible area; click/drag to pan. Infinite
+//! canvases show their (coarse) content bounds, see `Document::extent`.
 
 use crate::app::AppState;
 use egui::{Color32, Sense, Stroke, Ui, Vec2};
@@ -6,7 +7,9 @@ use egui::{Color32, Sense, Stroke, Ui, Vec2};
 pub fn ui(s: &mut AppState, ui: &mut Ui) {
     let Some(d) = s.doc() else { return super::no_doc(ui) };
     let doc = d.doc().clone();
-    let (w, h) = (doc.info.width as f32, doc.info.height as f32);
+    let ext = doc.extent();
+    let (ox, oy) = (ext.x0 as f32, ext.y0 as f32);
+    let (w, h) = (ext.width().max(1) as f32, ext.height().max(1) as f32);
     let avail = ui.available_width().min(320.0);
     let scale = (avail / w).min(200.0 / h);
     let size = Vec2::new(w * scale, h * scale);
@@ -37,11 +40,11 @@ pub fn ui(s: &mut AppState, ui: &mut Ui) {
     // visible area (approximate: canvas size unknown here, use last zoom & a nominal viewport)
     let vp = ui.ctx().content_rect().size() * 0.6;
     let half = Vec2::new(vp.x / d.view.zoom * 0.5, vp.y / d.view.zoom * 0.5);
-    let c = egui::pos2(rect.left() + d.view.pan[0] * scale, rect.top() + d.view.pan[1] * scale);
+    let c = egui::pos2(rect.left() + (d.view.pan[0] - ox) * scale, rect.top() + (d.view.pan[1] - oy) * scale);
     let vr = egui::Rect::from_center_size(c, half * 2.0 * scale);
     ui.painter().rect_stroke(vr.intersect(rect.expand(2.0)), 0.0, Stroke::new(1.5, crate::theme::ACCENT), egui::StrokeKind::Middle);
     if let Some(p) = resp.interact_pointer_pos().filter(|_| resp.dragged() || resp.clicked()) {
-        d.view.pan = [((p.x - rect.left()) / scale).clamp(0.0, w), ((p.y - rect.top()) / scale).clamp(0.0, h)];
+        d.view.pan = [ox + ((p.x - rect.left()) / scale).clamp(0.0, w), oy + ((p.y - rect.top()) / scale).clamp(0.0, h)];
         d.view.fitted = false;
     }
     ui.horizontal(|ui| {
