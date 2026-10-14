@@ -14,6 +14,7 @@ use crate::stroke::GpuStroke;
 use crate::upload::{UploadCache, UploadKey};
 use prisme_core::graph::{Node, ParamValue};
 use prisme_core::layer::{FillContent, Layer, LayerKind};
+use prisme_core::tile::TILE_SIZE;
 use prisme_core::{Document, Gradient, IRect, LayerId, NodeId, TileGrid};
 use prisme_graph::{eval_curve, registry, SocketType, CURVE_CHANNELS, LEVEL_CHANNELS};
 use std::collections::{HashMap, HashSet};
@@ -845,18 +846,33 @@ impl Engine {
         Some(out)
     }
 
-    /// The upload with the live stroke spliced in (block-averaged at mip > 0).
+    /// The upload with the live stroke tiles spliced in (block-averaged at mip > 0). Each
+    /// tile's footprint at this level is rendered on its own and copied in. Past mip 8 a level
+    /// pixel spans several tiles: the regular upload shows until the stroke lands.
     fn stroke_view(&mut self, f: &mut Frame, s: &GpuStroke, regular: Option<GpuImage>, rect: IRect, default: f32) -> Option<GpuImage> {
-        let Some(live) = s.live() else { return regular };
         let k = 1i32 << f.mip;
-        let lr = live.rect;
-        let level = IRect::new(lr.x0.div_euclid(k), lr.y0.div_euclid(k), (lr.x1 + k - 1).div_euclid(k), (lr.y1 + k - 1).div_euclid(k));
-        if level.intersect(&rect).is_empty() {
+        if k > TILE_SIZE as i32 {
             return regular;
         }
+        let hits: Vec<(IRect, GpuImage)> = s
+            .live_tiles()
+            .filter_map(|(c, t)| {
+                let r = c.rect();
+                let level = IRect::new(r.x0 / k, r.y0 / k, r.x1 / k, r.y1 / k).intersect(&rect);
+                (!level.is_empty()).then(|| (level, t.clone()))
+            })
+            .collect();
+        if hits.is_empty() {
+            return regular;
+        }
+        let p = [k as f32, s.channels() as f32, default];
         let mut out = self.new_image(f, rect);
-        let live = live.clone();
-        self.run(f, "k_stroke_view", &out, [regular.as_ref(), Some(&live), None, None], &[k as f32, s.channels() as f32, default], None);
+        self.run(f, "k_stroke_view", &out, [regular.as_ref(), None, None, None], &p, None);
+        for (level, tile) in hits {
+            let part = self.new_image(f, level);
+            self.run(f, "k_stroke_view", &part, [regular.as_ref(), Some(&tile), None, None], &p, None);
+            crate::stroke::copy(&mut f.enc, &part, &out, level);
+        }
         out.straight = true;
         Some(out)
     }

@@ -16,6 +16,15 @@ pub struct Readback {
 impl Readback {
     /// Start reading `region` (level rect inside `image.rect`).
     pub fn start(device: &wgpu::Device, queue: &wgpu::Queue, image: &GpuImage, region: IRect) -> Readback {
+        let mut enc = device.create_command_encoder(&Default::default());
+        let rb = Self::record(device, &mut enc, image, region);
+        queue.submit([enc.finish()]);
+        rb.map();
+        rb
+    }
+
+    /// Record the copy of `region` into `enc`; call [`Readback::map`] once it's submitted.
+    pub fn record(device: &wgpu::Device, enc: &mut wgpu::CommandEncoder, image: &GpuImage, region: IRect) -> Readback {
         let region = region.intersect(&image.rect);
         let format = image.format();
         let bpp = format.block_copy_size(None).unwrap_or(8);
@@ -28,7 +37,6 @@ impl Readback {
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let mut enc = device.create_command_encoder(&Default::default());
         if !region.is_empty() {
             enc.copy_texture_to_buffer(
                 wgpu::TexelCopyTextureInfo {
@@ -48,13 +56,21 @@ impl Readback {
                 wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
             );
         }
-        queue.submit([enc.finish()]);
-        let state = Arc::new(Mutex::new(None));
-        let s2 = state.clone();
-        buffer.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+        Readback { buffer, rect: region, bytes_per_row, bpp, format, state: Arc::new(Mutex::new(None)) }
+    }
+
+    /// Map the buffer once the recorded copy has been submitted.
+    pub fn map(&self) {
+        let s2 = self.state.clone();
+        self.buffer.slice(..).map_async(wgpu::MapMode::Read, move |r| {
             *s2.lock().unwrap() = Some(r.is_ok());
         });
-        Readback { buffer, rect: region, bytes_per_row, bpp, format, state }
+    }
+
+    /// Non-blocking: whether [`Readback::try_take`] would return the pixels.
+    pub fn ready(&self, device: &wgpu::Device) -> bool {
+        let _ = device.poll(wgpu::PollType::Poll);
+        self.state.lock().unwrap().is_some()
     }
 
     /// Non-blocking poll. Returns RGBA f32 (row-major) once ready.

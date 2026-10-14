@@ -43,7 +43,8 @@ pub struct DocStroke {
     tiles: HashSet<TileCoord>,
     /// Set once the tool ended the stroke; it then waits for `readback`.
     label: Option<String>,
-    readback: Option<Readback>,
+    /// One per tile (dab strokes) or one for the bake (Liquify).
+    readback: Option<Vec<Readback>>,
     device: prisme_gpu::wgpu::Device,
 }
 
@@ -99,7 +100,7 @@ pub fn feed(d: &mut DocState, engine: &mut Engine, ops: Vec<StrokeOp>) {
                 if let Some(s) = d.stroke.as_mut().filter(|s| s.label.is_none() && s.gpu.is_liquify()) {
                     let r = field.active_rect();
                     s.tiles = TileGrid::coords_in(&r).collect();
-                    s.readback = engine.liquify_readback(&s.gpu, r, true);
+                    s.readback = engine.liquify_readback(&s.gpu, r, true).map(|rb| vec![rb]);
                     if let Replay::Liquify(_, f) = &mut s.replay {
                         *f = Some(field);
                     }
@@ -173,9 +174,9 @@ impl DocState {
         }
         let s = self.stroke.take().unwrap();
         #[cfg(not(target_arch = "wasm32"))]
-        let px = s.readback.as_ref().map(|rb| rb.wait(&s.device));
+        let px = s.readback.as_ref().map(|rbs| rbs.iter().map(|rb| rb.wait(&s.device)).collect());
         #[cfg(target_arch = "wasm32")]
-        let px = s.readback.as_ref().and_then(|rb| rb.try_take(&s.device));
+        let px = s.readback.as_ref().filter(|rbs| rbs.iter().all(|rb| rb.ready(&s.device))).and_then(|rbs| rbs.iter().map(|rb| rb.try_take(&s.device)).collect());
         self.land(s, px);
     }
 
@@ -183,10 +184,8 @@ impl DocState {
     fn poll_stroke(&mut self) -> bool {
         let Some(s) = self.stroke.as_ref().filter(|s| s.label.is_some()) else { return false };
         let px = match &s.readback {
-            Some(rb) => match rb.try_take(&s.device) {
-                Some(px) => Some(px),
-                None => return true,
-            },
+            Some(rbs) if !rbs.iter().all(|rb| rb.ready(&s.device)) => return true,
+            Some(rbs) => rbs.iter().map(|rb| rb.try_take(&s.device)).collect(),
             None => None,
         };
         let s = self.stroke.take().unwrap();
@@ -195,11 +194,21 @@ impl DocState {
     }
 
     /// Write the stroke into the tiles as one history entry (and into an open working copy).
-    fn land(&mut self, s: DocStroke, px: Option<Vec<f32>>) {
+    fn land(&mut self, s: DocStroke, px: Option<Vec<Vec<f32>>>) {
+        // All parts must have arrived intact, or the CPU replays the whole stroke.
+        let parts = match (&px, &s.readback) {
+            (Some(px), Some(rbs)) if px.len() == rbs.len() && px.iter().zip(rbs).all(|(p, rb)| p.len() == rb.rect.area() as usize * s.channels) => Some(rbs.iter().zip(px)),
+            _ => None,
+        };
         let apply = |doc: &mut Document| {
-            let written = match (&px, &s.readback) {
-                (Some(px), Some(rb)) if !px.is_empty() => write_stroke(doc, s.target, s.base_default, rb.rect, px, s.channels, &s.tiles),
-                _ => false,
+            let written = match parts.clone() {
+                Some(parts) => {
+                    for (rb, px) in parts {
+                        write_stroke(doc, s.target, s.base_default, rb.rect, px, s.channels, TileGrid::coords_in(&rb.rect).filter(|c| s.tiles.contains(c)));
+                    }
+                    true
+                }
+                None => false,
             };
             if !written {
                 match &s.replay {

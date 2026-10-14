@@ -7,6 +7,10 @@ pub struct GpuContext {
 
 impl GpuContext {
     pub fn new(device: wgpu::Device, queue: wgpu::Queue) -> Self {
+        // wgpu panics on uncaptured errors by default. In release builds log them instead: a
+        // failed allocation (out of VRAM) shouldn't take unsaved documents down with it.
+        #[cfg(not(debug_assertions))]
+        device.on_uncaptured_error(std::sync::Arc::new(|e: wgpu::Error| log::error!("wgpu: {e}")));
         Self { device, queue }
     }
 

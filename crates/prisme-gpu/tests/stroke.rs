@@ -60,12 +60,14 @@ fn gpu(e: &mut Engine, d: &Document, sp: &StrokeSpec, dabs: &[Dab]) -> Document 
     for c in dabs.chunks(7) {
         e.stroke_dabs(&mut s, c);
     }
-    let rb = e.stroke_readback(&s).expect("readback");
-    let px = rb.wait(&e.ctx.device);
     let mut out = d.clone();
     let mut tiles = HashSet::new();
     dab_tiles(dabs, &mut tiles);
-    assert!(write_stroke(&mut out, sp.target, sp.base_default, rb.rect, &px, sp.base.channels as usize, &tiles), "layout mismatch");
+    for rb in e.stroke_readback(&s).expect("readback") {
+        let px = rb.wait(&e.ctx.device);
+        let mine = TileGrid::coords_in(&rb.rect).filter(|c| tiles.contains(c));
+        assert!(write_stroke(&mut out, sp.target, sp.base_default, rb.rect, &px, sp.base.channels as usize, mine), "layout mismatch");
+    }
     out
 }
 
@@ -122,6 +124,53 @@ fn opacity_caps_flow_builds_up() {
         let expect = 1.0 - 0.7f32.powi(n as i32);
         assert!((a - expect).abs() < 1e-5, "flow x{n}: {a} vs {expect}");
     }
+}
+
+/// Zoomed out on an infinite canvas, a big brush sweeps a huge bounding box: the stroke
+/// only holds the tiles it touches, stays on the GPU and lands like the CPU engine.
+#[test]
+fn long_sweep_stays_on_gpu() {
+    let Some(mut e) = engine() else { return };
+    let d = doc(PixelFormat::F16);
+    let t = target(&d);
+    let sp = spec(&d, t, StrokeMode::Paint { target: BlendTarget::Color([1.0, 0.2, 0.0, 1.0]), opacity: 0.8, lock_alpha: false }, None);
+    // 31 dabs of radius 300 along a 30000 x 21000 px diagonal.
+    let ds: Vec<Dab> = (0..=30)
+        .map(|i| {
+            let p = i as f32 * 1000.0 - 2000.0;
+            Dab { center: [p, p * 0.7], radius: 300.0, angle: 0.0, roundness: 1.0, hardness: 0.5, alpha: 0.7, tip: TipShape::Round, pixel: false, grain: 0.0, seed: 1 }
+        })
+        .collect();
+    let mut s = e.stroke_begin(key(t), sp.base.clone(), sp.base_default, None, sp.mode);
+    for c in ds.chunks(5) {
+        e.stroke_dabs(&mut s, c);
+    }
+    assert!(!s.overflow, "overflowed");
+    // ~12 tiles per dab, not the 630 Mpx bounding box.
+    assert!(s.tile_bytes() < 1 << 30, "{} MiB of tiles", s.tile_bytes() >> 20);
+    drop(s);
+    let (a, b) = (grid(&gpu(&mut e, &d, &sp, &ds), t), grid(&cpu(&d, &sp, &ds), t));
+    let keys: HashSet<_> = a.tiles.keys().chain(b.tiles.keys()).copied().collect();
+    assert!(keys.len() > 300, "{} tiles", keys.len());
+    for c in keys {
+        let r = c.rect();
+        let max = a.read_rect(&r).iter().zip(b.read_rect(&r)).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        assert!(max < 2e-3, "tile {c:?}: max diff {max}");
+    }
+}
+
+/// A stroke whose tiles would exceed the VRAM budget overflows to the CPU before allocating.
+#[test]
+fn over_budget_stroke_overflows() {
+    let Some(mut e) = engine() else { return };
+    let d = doc(PixelFormat::F16);
+    let t = target(&d);
+    let sp = spec(&d, t, StrokeMode::Paint { target: BlendTarget::Color([1.0, 0.0, 0.0, 1.0]), opacity: 1.0, lock_alpha: false }, None);
+    let mut s = e.stroke_begin(key(t), sp.base.clone(), sp.base_default, None, sp.mode);
+    let dab = Dab { center: [0.0, 0.0], radius: 20000.0, angle: 0.0, roundness: 1.0, hardness: 0.5, alpha: 1.0, tip: TipShape::Round, pixel: false, grain: 0.0, seed: 1 };
+    e.stroke_dabs(&mut s, &[dab]);
+    assert!(s.overflow && s.tile_bytes() == 0);
+    assert!(e.stroke_readback(&s).is_none());
 }
 
 #[test]
@@ -219,11 +268,12 @@ fn preview_splices_stroke() {
     let d = doc(PixelFormat::F32);
     let t = target(&d);
     let sp = spec(&d, t, StrokeMode::Paint { target: BlendTarget::Color([1.0, 0.1, 0.1, 1.0]), opacity: 0.9, lock_alpha: false }, None);
-    let ds = dabs(BrushSettings { size: 30.0, ..Default::default() }, &LINE);
+    // Crosses the tile edge at x = 256 (the view splices tile by tile).
+    let ds = dabs(BrushSettings { size: 30.0, ..Default::default() }, &[LINE.as_slice(), &[[200.0, 40.0], [290.0, 120.0], [240.0, 180.0]]].concat());
     let landed = cpu(&d, &sp, &ds);
     let mut s = e.stroke_begin(key(t), sp.base.clone(), 0.0, None, sp.mode);
     e.stroke_dabs(&mut s, &ds);
-    for mip in [0u32, 1, 2] {
+    for mip in [0u32, 1, 2, 4] {
         let k = 1 << mip;
         let rect = IRect::new(0, 0, 300 / k, 200 / k);
         let read = |e: &mut Engine, doc: &Document, s: Option<&prisme_gpu::GpuStroke>| {
