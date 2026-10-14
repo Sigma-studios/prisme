@@ -167,9 +167,37 @@ pub struct EpiIntegration {
     close: bool,
 
     can_drag_window: bool,
+    // PRISME PATCH: modifier state for `clipboard_key` below.
+    modifiers: winit::keyboard::ModifiersState,
     #[cfg(feature = "persistence")]
     persist_window: bool,
     app_icon_setter: super::app_icon::AppTitleIconSetter,
+}
+
+/// PRISME PATCH: the C/X/V key of a Cmd/Ctrl clipboard shortcut press (logical key, or the
+/// physical one for non-Latin layouts, like egui-winit).
+fn clipboard_key(ke: &winit::event::KeyEvent, m: winit::keyboard::ModifiersState) -> Option<egui::Key> {
+    use winit::keyboard::{Key, KeyCode, PhysicalKey};
+    let command = if cfg!(target_os = "macos") { m.super_key() } else { m.control_key() };
+    if ke.state != winit::event::ElementState::Pressed || !command {
+        return None;
+    }
+    if let Key::Character(c) = &ke.logical_key
+        && c.chars().all(|c| c.is_ascii_alphabetic())
+    {
+        return match c.to_lowercase().as_str() {
+            "c" => Some(egui::Key::C),
+            "x" => Some(egui::Key::X),
+            "v" => Some(egui::Key::V),
+            _ => None,
+        };
+    }
+    match ke.physical_key {
+        PhysicalKey::Code(KeyCode::KeyC) => Some(egui::Key::C),
+        PhysicalKey::Code(KeyCode::KeyX) => Some(egui::Key::X),
+        PhysicalKey::Code(KeyCode::KeyV) => Some(egui::Key::V),
+        _ => None,
+    }
 }
 
 impl EpiIntegration {
@@ -224,6 +252,7 @@ impl EpiIntegration {
             pending_full_output: Default::default(),
             close: false,
             can_drag_window: false,
+            modifiers: Default::default(),
             #[cfg(feature = "persistence")]
             persist_window: native_options.persist_window,
             app_icon_setter,
@@ -259,7 +288,28 @@ impl EpiIntegration {
             self.can_drag_window = true;
         }
 
-        egui_winit.on_window_event(window, event)
+        // PRISME PATCH: egui-winit turns Cmd/Ctrl+C/X/V into `Event::Copy/Cut/Paste` and drops
+        // the key — and sends nothing at all for a paste when the clipboard holds no text (an
+        // image). Forward the key press too so apps can bind those shortcuts; text fields keep
+        // using the clipboard events.
+        if let WindowEvent::ModifiersChanged(m) = event {
+            self.modifiers = m.state();
+        }
+        let response = egui_winit.on_window_event(window, event);
+        if let WindowEvent::KeyboardInput { event: ke, .. } = event
+            && let Some(key) = clipboard_key(ke, self.modifiers)
+        {
+            let m = self.modifiers;
+            let modifiers = egui::Modifiers {
+                alt: m.alt_key(),
+                ctrl: m.control_key(),
+                shift: m.shift_key(),
+                mac_cmd: cfg!(target_os = "macos") && m.super_key(),
+                command: if cfg!(target_os = "macos") { m.super_key() } else { m.control_key() },
+            };
+            egui_winit.egui_input_mut().events.push(egui::Event::Key { key, physical_key: Some(key), pressed: true, repeat: ke.repeat, modifiers });
+        }
+        response
     }
 
     pub fn pre_update(&mut self) {

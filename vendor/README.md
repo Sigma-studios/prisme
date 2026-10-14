@@ -36,3 +36,14 @@ wrong for linear `ExtendedSrgbLinear` (scRGB).
 - `web/web_painter_wgpu.rs`: the canvas is configured with `surface_color.configured`.
   Each paint calls `egui_wgpu::sync_surface_color` and reconfigures on change. On WebGPU,
   `ExtendedSrgb` becomes canvas `toneMapping: { mode: "extended" }`.
+
+## eframe 0.36.2 — clipboard shortcut keys (native)
+
+egui-winit turns Cmd/Ctrl+C/X/V into `Event::Copy/Cut/Paste` and drops the key event, and
+sends nothing at all for Cmd/Ctrl+V when the clipboard holds no text (an image). Apps can't bind
+those shortcuts (Paste image, Copy Merged = Cmd+Shift+C, Paste as New Image = Cmd+Alt+V).
+
+- `native/epi_integration.rs`: `EpiIntegration::on_window_event` also forwards those key
+  presses as `Event::Key` (tracking modifiers from `ModifiersChanged`); `clipboard_key` picks
+  the key like egui-winit (logical, physical fallback for non-Latin layouts). Text fields keep
+  using the clipboard events. The web runner already forwards the key.

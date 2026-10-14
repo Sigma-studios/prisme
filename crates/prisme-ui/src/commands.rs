@@ -30,7 +30,7 @@ pub fn handle_shortcuts(s: &mut AppState, ctx: &egui::Context) {
         let mut keys = vec![];
         for e in events {
             match e {
-                egui::Event::Text(t) => keys.push(ToolKey::Text(t)),
+                egui::Event::Text(t) | egui::Event::Paste(t) => keys.push(ToolKey::Text(t)),
                 egui::Event::Key { key, pressed: true, modifiers, .. } => {
                     if modifiers.command {
                         continue;
@@ -54,12 +54,14 @@ pub fn handle_shortcuts(s: &mut AppState, ctx: &egui::Context) {
         for k in keys {
             tool_key(s, &k);
         }
-        // Still allow Cmd shortcuts (undo, save…).
-        let actions: Vec<Action> = s.settings.keymap.triggered(ctx).into_iter().filter(|a| s.settings.keymap.get(*a).is_some_and(|b| b.command)).collect();
+        // Still allow Cmd shortcuts (undo, save…), except the clipboard ones: pasting goes
+        // into the text above.
+        let clipboard = [Action::Cut, Action::Copy, Action::CopyMerged, Action::Paste, Action::PasteNewDoc];
+        let actions: Vec<Action> = s.settings.keymap.triggered(ctx).into_iter().filter(|a| !clipboard.contains(a) && s.settings.keymap.get(*a).is_some_and(|b| b.command)).collect();
         for a in actions {
             run_action(s, a, ctx);
         }
-        ctx.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Text(_) | egui::Event::Key { .. })));
+        ctx.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Text(_) | egui::Event::Paste(_) | egui::Event::Key { .. })));
         return;
     }
     if ctx.egui_wants_keyboard_input() {
@@ -680,9 +682,12 @@ fn paste(s: &mut AppState, new_doc: bool) {
     s.jobs.push(crate::jobs::Job::ClipboardGet { pending: prisme_platform::clipboard_get_image(), new_doc });
 }
 
-/// Paste pixels as a new layer (centered on the view when they came from outside).
+/// Paste pixels as a new layer (centered on the view when they came from outside). With no
+/// document, or only the untouched launch document (which it replaces), the paste becomes a
+/// new image of its own size.
 pub fn paste_grid(s: &mut AppState, grid: TileGrid, bounds: IRect, new_doc: bool) {
-    if new_doc || s.docs.is_empty() {
+    let blank = s.doc().is_some_and(|d| d.blank_startup && !d.is_dirty() && d.path.is_none());
+    if new_doc || blank || s.docs.is_empty() {
         let mut d = Document::new("Pasted", bounds.width() as u32, bounds.height() as u32, grid.format);
         let id = d.alloc_layer_id();
         d.layers.push(Layer::new(id, "Pasted", LayerKind::Raster(Arc::new(grid.translated(-bounds.x0, -bounds.y0)))));
