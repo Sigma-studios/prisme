@@ -285,6 +285,7 @@ pub fn step(s: &mut AppState, sc: &mut Script, ctx: &egui::Context) {
             };
         }
         "hdr-status" => log::info!("script: hdr-status {:?} (mode {:?}, highlights {:?})", s.hdr, s.settings.hdr_mode, s.settings.hdr_highlights),
+        "terminate" => prisme_platform::request_app_terminate(),
         "quit" => {
             s.dialogs.allow_quit = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);

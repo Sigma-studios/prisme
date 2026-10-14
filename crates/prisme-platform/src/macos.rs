@@ -169,3 +169,30 @@ pub fn open_url(url: &str) {
         log::warn!("open_url({url}): {e}");
     }
 }
+
+/// winit's app delegate doesn't implement `applicationShouldTerminate:`, so Cmd+Q / Dock ▸ Quit
+/// terminate without a window-close event. Add the method to its class: it cancels the
+/// termination while documents are unsaved (the app then shows its own quit prompt).
+pub fn install_quit_guard() {
+    use objc2::runtime::{AnyClass, AnyObject, Sel};
+    unsafe extern "C-unwind" fn should_terminate(_this: *mut AnyObject, _sel: Sel, _sender: *mut AnyObject) -> usize {
+        // NSTerminateNow = 1, NSTerminateCancel = 0.
+        if crate::quit_allowed() { 1 } else { 0 }
+    }
+    let Some(cls) = AnyClass::get(c"WinitApplicationDelegate") else {
+        log::warn!("prisme-platform: winit app delegate not found; Cmd+Q won't ask about unsaved changes");
+        return;
+    };
+    unsafe {
+        let imp: objc2::runtime::Imp = std::mem::transmute(
+            should_terminate as unsafe extern "C-unwind" fn(*mut AnyObject, Sel, *mut AnyObject) -> usize,
+        );
+        // Fails (returns NO) if the method already exists, which is fine.
+        objc2::ffi::class_addMethod(cls as *const AnyClass as *mut AnyClass, objc2::sel!(applicationShouldTerminate:), imp, c"Q@:@".as_ptr());
+    }
+}
+
+pub fn request_app_terminate() {
+    let Some(mtm) = MainThreadMarker::new() else { return };
+    unsafe { objc2_app_kit::NSApplication::sharedApplication(mtm).terminate(None) };
+}

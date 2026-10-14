@@ -125,6 +125,8 @@ fn default_dock() -> DockState<Tab> {
 
 impl PrismeApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let wake = cc.egui_ctx.clone();
+        prisme_platform::install_quit_guard(move || wake.request_repaint());
         let settings: Settings = cc
             .storage
             .and_then(|s| s.get_string(SETTINGS_KEY))
@@ -358,18 +360,25 @@ impl eframe::App for PrismeApp {
 
         crate::hdr::update(s, &ctx);
         // Window close with unsaved documents: hold it and ask.
-        let closing = ctx.input(|i| i.viewport().close_requested());
+        // App-level quit held by the platform (macOS Cmd+Q / Dock ▸ Quit) counts as a close.
+        let quit_req = prisme_platform::take_quit_request();
+        let closing = quit_req || ctx.input(|i| i.viewport().close_requested());
         if closing {
             // A stroke still landing isn't in the history yet: land it before checking dirtiness.
             crate::stroke::commit_liquify(s);
             s.docs.iter_mut().for_each(|d| d.finish_stroke());
         }
         if closing && !s.dialogs.allow_quit && s.docs.iter().any(|d| d.is_dirty()) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            if !quit_req {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            }
             s.dialogs.confirm_quit = true;
         } else if closing {
             // Clean exit (all saved, or changes discarded): nothing to recover next launch.
             crate::jobs::clear_autosaves(s);
+            if quit_req {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
         }
         crate::jobs::quit_flow(s, &ctx);
         crate::commands::handle_shortcuts(s, &ctx);

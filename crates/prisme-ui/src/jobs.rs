@@ -159,7 +159,8 @@ pub fn saving(s: &AppState) -> bool {
 /// Drives "Save all and quit": saves dirty documents one at a time (one save dialog open at
 /// once), then closes the window.
 pub fn quit_flow(s: &mut AppState, ctx: &egui::Context) {
-    prisme_platform::set_unsaved_changes(s.docs.iter().any(|d| d.is_dirty()));
+    // A stroke landing or an open Liquify session is unsaved work too.
+    prisme_platform::set_unsaved_changes(s.docs.iter().any(|d| d.is_dirty() || d.stroke.is_some()));
     if !s.dialogs.quit_after_save || saving(s) {
         return;
     }

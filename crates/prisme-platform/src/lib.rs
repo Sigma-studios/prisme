@@ -305,14 +305,52 @@ pub fn now_seconds() -> f64 {
         .as_secs_f64()
 }
 
+static UNSAVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static QUIT_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static QUIT_WAKE: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>> = std::sync::OnceLock::new();
+
 /// Tell the platform whether any document has unsaved changes. Web: while set, closing or
-/// reloading the tab shows the browser's "Leave site?" prompt. Native: no-op (the app
-/// intercepts window close itself).
+/// reloading the tab shows the browser's "Leave site?" prompt. macOS: an app-level quit
+/// (Cmd+Q, Dock ▸ Quit) is held and reported through [`take_quit_request`]. Window close is
+/// intercepted by the app itself on every platform.
 pub fn set_unsaved_changes(dirty: bool) {
+    UNSAVED.store(dirty, std::sync::atomic::Ordering::Relaxed);
     #[cfg(target_arch = "wasm32")]
     web::set_unsaved_changes(dirty);
-    #[cfg(not(target_arch = "wasm32"))]
-    let _ = dirty;
+}
+
+/// Hook app-level quit requests that bypass window close (macOS Cmd+Q / Dock ▸ Quit). `wake`
+/// is called when one was held so the UI can repaint and ask. Call once, after the event loop
+/// exists. No-op elsewhere.
+pub fn install_quit_guard(wake: impl Fn() + Send + Sync + 'static) {
+    let _ = QUIT_WAKE.set(Box::new(wake));
+    #[cfg(target_os = "macos")]
+    macos::install_quit_guard();
+}
+
+/// Ask the OS to quit the app the way Cmd+Q does (macOS `[NSApp terminate:]`; for scripted
+/// tests). Elsewhere: no-op.
+pub fn request_app_terminate() {
+    #[cfg(target_os = "macos")]
+    macos::request_app_terminate();
+}
+
+/// True once after an app-level quit was held because of unsaved changes.
+pub fn take_quit_request() -> bool {
+    QUIT_REQUESTED.swap(false, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Called by the platform hook: hold the quit (false) while anything is unsaved.
+#[allow(dead_code)]
+pub(crate) fn quit_allowed() -> bool {
+    if !UNSAVED.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    QUIT_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Some(w) = QUIT_WAKE.get() {
+        w();
+    }
+    false
 }
 
 /// Open a URL in the default browser (web: a new tab).
