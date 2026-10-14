@@ -3,6 +3,38 @@ use prisme_color::{Mat3, RgbSpace, Transfer};
 use prisme_core::geom::Affine2;
 use wgpu::util::DeviceExt;
 
+/// How highlights above the display's HDR headroom are handled.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum HighlightMode {
+    /// Clip each channel at the display peak.
+    Clip,
+    /// Smooth shoulder from 0.75·peak to the peak, preserving hue
+    /// (see [`prisme_color::hdr::soft_rolloff`]).
+    #[default]
+    SoftRolloff,
+}
+
+/// What the presentation surface expects from the display pass.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum DisplayOutput {
+    /// Standard dynamic range: output clamped to [0, 1] in `display_space` (or through the
+    /// baked display ICC LUT when one is installed). Surface colour space `Srgb`.
+    #[default]
+    Sdr,
+    /// Extended-range sRGB-*encoded* surface (`SurfaceColorSpace::ExtendedSrgb`: Metal EDR,
+    /// WebGPU `toneMapping: "extended"`). Working Rec.2020 is converted to linear BT.709
+    /// primaries (negative = outside sRGB, kept), working 1.0 maps to SDR reference white
+    /// (1.0), highlights are limited to `peak` (headroom, × SDR white), then encoded with the
+    /// sign-mirrored, unbounded sRGB curve. The OS/browser colour-manages from there.
+    ExtendedSrgb { peak: f32, highlights: HighlightMode },
+}
+
+impl DisplayOutput {
+    pub fn is_hdr(self) -> bool {
+        !matches!(self, DisplayOutput::Sdr)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct DisplayParams {
     /// Maps framebuffer pixels to document pixels.
@@ -14,7 +46,13 @@ pub struct DisplayParams {
     /// Target space used when no display LUT is loaded.
     pub display_space: RgbSpace,
     pub exposure: f32,
+    /// Dithering (SDR only: an fp16 extended-range surface doesn't need it, and noise sized
+    /// for 8-bit SDR steps would be pointless there).
     pub dither: bool,
+    /// SDR or extended-range (HDR) output.
+    pub output: DisplayOutput,
+    /// Background / checkerboard colours, sRGB-encoded in [0, 1]: they stay at (or below)
+    /// SDR white on an HDR surface too.
     pub bg: [f32; 3],
     pub checker_a: [f32; 3],
     pub checker_b: [f32; 3],
@@ -41,6 +79,9 @@ struct ViewUniform {
     bg: [f32; 4],
     chk_a: [f32; 4],
     chk_b: [f32; 4],
+    /// x: 0 SDR, 1 extended sRGB (HDR) · y: peak (× SDR white) · z: 1 soft roll-off, 0 clip ·
+    /// w: roll-off knee.
+    hdr: [f32; 4],
 }
 
 /// Draws the evaluated canvas into an existing render pass (egui paint callback).
@@ -196,9 +237,21 @@ impl DisplayRenderer {
 
     pub fn prepare(&mut self, device: &wgpu::Device, p: &DisplayParams, image: &GpuImage) {
         let m = p.fb_to_doc.m;
-        let disp: Mat3 = p.display_space.from_working_matrix();
+        // HDR always uses the analytic transform to linear BT.709 (extended sRGB): the baked ICC
+        // LUT targets the display's *device* RGB with a [0, 1]-clamped domain, whereas on an
+        // extended-range surface the OS/browser colour-manages from extended sRGB itself and
+        // values above 1.0 / below 0.0 must survive.
+        let hdr = match p.output {
+            DisplayOutput::Sdr => [0.0; 4],
+            DisplayOutput::ExtendedSrgb { peak, highlights } => {
+                let peak = peak.max(1.0);
+                [1.0, peak, (highlights == HighlightMode::SoftRolloff) as i32 as f32, prisme_color::hdr::rolloff_knee(peak)]
+            }
+        };
+        let space = if p.output.is_hdr() { RgbSpace::Srgb } else { p.display_space };
+        let disp: Mat3 = space.from_working_matrix();
         let d = disp.to_wgsl_padded();
-        let transfer = match p.display_space.transfer() {
+        let transfer = match space.transfer() {
             Transfer::Srgb => 0.0,
             Transfer::Linear => 1.0,
             Transfer::Gamma(g) if (g - 2.2).abs() < 0.05 => 2.0,
@@ -220,10 +273,11 @@ impl DisplayRenderer {
             transfer,
             target_srgb: self.target_srgb as i32 as f32,
             exposure: p.exposure,
-            dither: p.dither as i32 as f32,
+            dither: (p.dither && !p.output.is_hdr()) as i32 as f32,
             bg: [p.bg[0], p.bg[1], p.bg[2], 1.0],
             chk_a: [p.checker_a[0], p.checker_a[1], p.checker_a[2], 1.0],
             chk_b: [p.checker_b[0], p.checker_b[1], p.checker_b[2], 1.0],
+            hdr,
         };
         let ubuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("display-view"),

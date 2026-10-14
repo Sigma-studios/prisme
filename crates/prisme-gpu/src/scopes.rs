@@ -6,22 +6,32 @@ use wgpu::util::DeviceExt;
 
 #[derive(Clone, Default)]
 pub struct ScopeData {
-    /// R, G, B, luma histograms (256 bins each).
+    /// R, G, B, luma histograms (256 bins each) of sRGB-encoded values clamped to SDR [0, 1].
     pub hist: Vec<[u32; 256]>,
-    /// 3 x 256 x 256 (row-major, top = bright).
+    /// Same, over the extended range: bin `i` covers encoded `i/255 · srgb_oetf(range)`,
+    /// i.e. linear [0, `range`] × SDR white. Equal to `hist` when `range == 1`.
+    pub hist_ext: Vec<[u32; 256]>,
+    /// Samples above SDR white (linear sRGB > 1.0) per R, G, B, luma.
+    pub over: [u32; 4],
+    /// Number of non-transparent samples.
+    pub total: u32,
+    /// Linear range (× SDR white) covered by `hist_ext` and `waveform`.
+    pub range: f32,
+    /// 3 x 256 x 256 (row-major, top = bright), over the extended range.
     pub waveform: Vec<u32>,
     /// 256 x 256 (OKLab a/b).
     pub vectorscope: Vec<u32>,
 }
 
-const HIST: u64 = 1024 * 4;
+const HIST_N: usize = 2056;
+const HIST: u64 = HIST_N as u64 * 4;
 const WAVE: u64 = 196_608 * 4;
 const VECS: u64 = 65_536 * 4;
 
 pub struct Scopes {
     pipeline: wgpu::ComputePipeline,
     bgl: wgpu::BindGroupLayout,
-    pending: Option<(wgpu::Buffer, Arc<Mutex<Option<bool>>>)>,
+    pending: Option<(wgpu::Buffer, Arc<Mutex<Option<bool>>>, f32)>,
     pub latest: Option<ScopeData>,
 }
 
@@ -81,15 +91,18 @@ impl Scopes {
     }
 
     /// Start computing scopes for `image` (skipped if a previous request is in flight).
-    pub fn request(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, image: &GpuImage) {
+    /// `range` (≥ 1, × SDR white) is the linear range of the extended histogram / waveform.
+    pub fn request(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, image: &GpuImage, range: f32) {
         if self.pending.is_some() {
             return;
         }
+        let range = range.max(1.0);
         let w = image.rect.width().max(1) as u32;
         let h = image.rect.height().max(1) as u32;
+        let enc_range = prisme_color::hdr::encode_extended_srgb(range);
         let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("scopes-params"),
-            contents: bytemuck::cast_slice(&[w, h, 0u32, 0u32]),
+            contents: bytemuck::cast_slice(&[w, h, 0u32, 0u32, range.to_bits(), enc_range.to_bits(), 0, 0]),
             usage: wgpu::BufferUsages::UNIFORM,
         });
         let mk = |size| {
@@ -135,12 +148,13 @@ impl Scopes {
         let state = Arc::new(Mutex::new(None));
         let s2 = state.clone();
         read.slice(..).map_async(wgpu::MapMode::Read, move |r| *s2.lock().unwrap() = Some(r.is_ok()));
-        self.pending = Some((read, state));
+        self.pending = Some((read, state, range));
     }
 
     /// Poll for completion; returns true when new data arrived.
     pub fn poll(&mut self, device: &wgpu::Device) -> bool {
-        let Some((buf, state)) = &self.pending else { return false };
+        let Some((buf, state, range)) = &self.pending else { return false };
+        let range = *range;
         let _ = device.poll(wgpu::PollType::Poll);
         let done = *state.lock().unwrap();
         match done {
@@ -150,14 +164,18 @@ impl Scopes {
                     let Ok(data) = buf.slice(..).get_mapped_range() else { self.pending = None; return false };
                     let u: &[u32] = bytemuck::cast_slice(&data);
                     let mut hist = vec![[0u32; 256]; 4];
-                    for (c, h) in hist.iter_mut().enumerate() {
-                        h.copy_from_slice(&u[c * 256..(c + 1) * 256]);
+                    let mut hist_ext = vec![[0u32; 256]; 4];
+                    for c in 0..4 {
+                        hist[c].copy_from_slice(&u[c * 256..(c + 1) * 256]);
+                        hist_ext[c].copy_from_slice(&u[1024 + c * 256..1024 + (c + 1) * 256]);
                     }
-                    let waveform = u[1024..1024 + 196_608].to_vec();
-                    let vectorscope = u[1024 + 196_608..].to_vec();
+                    let over = [u[2048], u[2049], u[2050], u[2051]];
+                    let total = u[2052];
+                    let waveform = u[HIST_N..HIST_N + 196_608].to_vec();
+                    let vectorscope = u[HIST_N + 196_608..].to_vec();
                     drop(data);
                     buf.unmap();
-                    self.latest = Some(ScopeData { hist, waveform, vectorscope });
+                    self.latest = Some(ScopeData { hist, hist_ext, over, total, range, waveform, vectorscope });
                 }
                 self.pending = None;
                 ok

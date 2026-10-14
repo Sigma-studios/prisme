@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/*", "apps/*"]
+exclude = ["vendor"]
 
 [workspace.package]
 version = "0.1.0"
@@ -47,3 +48,10 @@ opt-level = 3
 [profile.release]
 lto = "thin"
 codegen-units = 4
+
+# HDR output: egui-wgpu / eframe 0.36.2 can't select a surface colour space. These are verbatim
+# copies of the crates.io 0.36.2 sources with small patches, every hunk marked "PRISME PATCH"
+# (see vendor/README.md). Drop them once upstream exposes surface colour spaces.
+[patch.crates-io]
+egui-wgpu = { path = "vendor/egui-wgpu" }
+eframe = { path = "vendor/eframe" }

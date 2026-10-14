@@ -78,6 +78,8 @@ pub struct AppState {
     pub node_editors: HashMap<u64, crate::panels::nodes::NodeEditor>,
     pub hover_doc: Option<[f32; 2]>,
     pub display_profile: Option<String>,
+    /// HDR output state, refreshed every frame by [`crate::hdr::update`].
+    pub hdr: crate::hdr::HdrStatus,
     pub last_autosave: f64,
     pub start_time: f64,
     pub frame_ms: f32,
@@ -182,6 +184,7 @@ impl PrismeApp {
             node_editors: HashMap::new(),
             hover_doc: None,
             display_profile,
+            hdr: Default::default(),
             last_autosave: now,
             start_time: now,
             frame_ms: 0.0,
@@ -342,6 +345,7 @@ impl eframe::App for PrismeApp {
             }
         }
 
+        crate::hdr::update(s, &ctx);
         crate::commands::handle_shortcuts(s, &ctx);
         handle_dropped_files(s, &ctx);
 

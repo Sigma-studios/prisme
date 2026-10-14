@@ -22,6 +22,15 @@ pub struct Settings {
     /// Recently opened/saved files, most recent first (native paths).
     pub recent_files: Vec<String>,
     pub dither_display: bool,
+    /// HDR / extended-range display output (see `crate::hdr`).
+    pub hdr_mode: crate::hdr::HdrMode,
+    /// How highlights above the display's headroom are shown in HDR mode.
+    pub hdr_highlights: prisme_gpu::HighlightMode,
+    /// Peak brightness (× SDR white) assumed when the platform doesn't report the display's
+    /// headroom (web browsers).
+    pub hdr_peak_fallback: f32,
+    /// Linear range (× SDR white) of the extended scopes; 0 = automatic.
+    pub scope_range: f32,
 }
 
 impl Default for Settings {
@@ -40,6 +49,10 @@ impl Default for Settings {
             recent_colors: vec![],
             recent_files: vec![],
             dither_display: true,
+            hdr_mode: crate::hdr::HdrMode::Auto,
+            hdr_highlights: prisme_gpu::HighlightMode::SoftRolloff,
+            hdr_peak_fallback: 4.0,
+            scope_range: 0.0,
         }
     }
 }

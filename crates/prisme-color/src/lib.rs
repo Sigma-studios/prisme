@@ -5,6 +5,7 @@
 //! CICP-tagged images and for UI colour pickers), ICC transforms through `moxcms` for
 //! embedded profiles, OKLab/OKLCh for perceptual operations, and display LUT baking.
 
+pub mod hdr;
 pub mod icc;
 pub mod lut;
 pub mod math;

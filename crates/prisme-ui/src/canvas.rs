@@ -356,6 +356,8 @@ pub fn set_color(s: &mut AppState, c: [f32; 4], to_bg: bool) {
 
 fn render(s: &mut AppState, ctx: &egui::Context, rect: Rect, ppp: f32, painter: &egui::Painter) {
     let use_dither = s.settings.dither_display;
+    let output = s.hdr.output(s.settings.hdr_highlights);
+    let scope_range = if s.settings.scope_range >= 1.0 { s.settings.scope_range } else { s.hdr.scope_range() };
     let pixel_grid = s.settings.pixel_grid;
     let editing_mask = s.settings.tools.edit_saved_mask;
     let active = s.active;
@@ -421,9 +423,14 @@ fn render(s: &mut AppState, ctx: &egui::Context, rect: Rect, ppp: f32, painter: 
             let now = prisme_platform::now_seconds();
             if now - g.scope_time > 0.25 {
                 g.scope_time = now;
-                g.scopes.request(&g.rs.device, &g.rs.queue, gi);
+                g.scopes.request(&g.rs.device, &g.rs.queue, gi, scope_range);
             }
         }
+    } else if let Some(gi) = &d.render.image
+        && g.scopes.latest.as_ref().is_some_and(|l| l.range != scope_range)
+    {
+        // Scope range changed (setting or display headroom): recompute.
+        g.scopes.request(&g.rs.device, &g.rs.queue, gi, scope_range);
     }
     if g.scopes.poll(&g.rs.device) {
         ctx.request_repaint();
@@ -438,6 +445,7 @@ fn render(s: &mut AppState, ctx: &egui::Context, rect: Rect, ppp: f32, painter: 
         display_space: prisme_color::RgbSpace::Srgb,
         exposure: 0.0,
         dither: use_dither,
+        output,
         bg: theme::CANVAS_BG,
         checker_a: [0.80, 0.80, 0.80],
         checker_b: [0.62, 0.62, 0.62],
