@@ -79,4 +79,7 @@ pub enum ToolKey {
     End,
     Char(char),
     Text(String),
+    /// Tool-local undo/redo (sent before the document's; Liquify steps back strokes).
+    Undo,
+    Redo,
 }

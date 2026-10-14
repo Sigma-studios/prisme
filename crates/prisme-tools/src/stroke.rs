@@ -6,6 +6,7 @@
 //! ends and lands it with [`write_stroke`] as one history edit. [`replay_stroke`] applies the
 //! same stroke with the CPU engine (no GPU, headless, or a readback that can't be awaited).
 
+use crate::liquify::{LiquifyField, LiquifySpec};
 use crate::paint::RetouchCanvas;
 use prisme_brush::{Dab, StrokeCanvas, StrokeMode};
 use prisme_core::tile::{Tile, TileCoord, TileGrid, TILE_SIZE};
@@ -48,6 +49,15 @@ pub enum StrokeOp {
     Dabs(Vec<Dab>),
     /// Stroke finished: land it as one history edit with this label.
     End(String),
+    /// Start a Liquify session: a stroke lasting until `LiquifyEnd` / `Abort` whose preview is
+    /// the target warped through a displacement field (see [`crate::liquify`]).
+    LiquifyBegin(LiquifySpec),
+    /// Field nodes changed: `nodes` rect with its row-major values.
+    LiquifyField { nodes: IRect, data: Vec<[f32; 4]> },
+    /// Bake the session: land the warped target as one history edit with this label.
+    LiquifyEnd { label: String, field: Arc<LiquifyField> },
+    /// Discard the in-progress stroke / session.
+    Abort,
 }
 
 /// Apply a whole stroke with the CPU engine (target must still hold `spec.base`).
@@ -74,14 +84,14 @@ pub fn dab_tiles(dabs: &[Dab], out: &mut HashSet<TileCoord>) {
 /// Land read-back stroke pixels: `px` covers `rect` (`channels` per pixel, row-major); only
 /// `tiles` are written so the stroke's bounding box doesn't materialize untouched tiles.
 /// Writes go through the tiles' own format (f16/f32). Returns false on a layout mismatch.
-pub fn write_stroke(doc: &mut Document, spec: &StrokeSpec, rect: IRect, px: &[f32], channels: usize, tiles: &HashSet<TileCoord>) -> bool {
-    let Some(g) = target_grid(doc, spec.target) else { return true };
+pub fn write_stroke(doc: &mut Document, target: PaintTarget, base_default: f32, rect: IRect, px: &[f32], channels: usize, tiles: &HashSet<TileCoord>) -> bool {
+    let Some(g) = target_grid(doc, target) else { return true };
     let ch = g.channels as usize;
     let w = rect.width() as usize;
     if ch != channels || px.len() != w * rect.height() as usize * ch {
         return false;
     }
-    let def = spec.base_default;
+    let def = base_default;
     for &c in tiles {
         let tr = c.rect().intersect(&rect);
         if tr.is_empty() {

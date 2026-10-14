@@ -242,7 +242,9 @@ impl AppState {
         if k == self.tool {
             return;
         }
-        // Leaving a tool aborts its interaction (uncommitted previews are discarded).
+        // Leaving Liquify applies its session; other tools abort their interaction
+        // (uncommitted previews are discarded).
+        crate::stroke::commit_liquify(self);
         if let Some(t) = self.tools.get_mut(&self.tool)
             && (t.busy() || k != self.tool) {
                 t.reset();
@@ -359,6 +361,7 @@ impl eframe::App for PrismeApp {
         let closing = ctx.input(|i| i.viewport().close_requested());
         if closing {
             // A stroke still landing isn't in the history yet: land it before checking dirtiness.
+            crate::stroke::commit_liquify(s);
             s.docs.iter_mut().for_each(|d| d.finish_stroke());
         }
         if closing && !s.dialogs.allow_quit && s.docs.iter().any(|d| d.is_dirty()) {
@@ -471,6 +474,7 @@ pub fn tool_icon(k: ToolKind) -> &'static str {
         ToolKind::Heal => ph::BANDAIDS,
         ToolKind::Smudge => ph::HAND_POINTING,
         ToolKind::Blur => ph::DROP,
+        ToolKind::Liquify => ph::HURRICANE,
         ToolKind::Ruler => ph::RULER,
         ToolKind::Hand => ph::HAND,
         ToolKind::Zoom => ph::MAGNIFYING_GLASS,
@@ -484,7 +488,7 @@ fn toolbar(s: &mut AppState, ui: &mut Ui) {
             &[ToolKind::Move, ToolKind::Transform, ToolKind::Crop],
             &[ToolKind::SelectRect, ToolKind::SelectEllipse, ToolKind::Lasso, ToolKind::PolyLasso, ToolKind::ColorSelect, ToolKind::BlobSelect],
             &[ToolKind::Brush, ToolKind::Eraser, ToolKind::Fill, ToolKind::Gradient],
-            &[ToolKind::Clone, ToolKind::Heal, ToolKind::Smudge, ToolKind::Blur],
+            &[ToolKind::Clone, ToolKind::Heal, ToolKind::Smudge, ToolKind::Blur, ToolKind::Liquify],
             &[ToolKind::Text, ToolKind::Picker, ToolKind::Ruler],
             &[ToolKind::Hand, ToolKind::Zoom],
         ];

@@ -1,3 +1,4 @@
+mod liquify;
 mod misc;
 mod painting;
 mod select;
@@ -7,6 +8,7 @@ use crate::input::{ToolInput, ToolKey};
 use crate::options::ToolOptions;
 use prisme_core::{Document, IRect, LayerId};
 
+pub use liquify::LiquifyTool;
 pub use misc::{approx_text_bounds, HandTool, PickerTool, RulerTool, TextTool, ZoomTool};
 pub use painting::{BrushTool, CloneTool, FillTool, GradientTool, RetouchTool};
 pub use select::{LassoTool, MarqueeTool, RegionTool};
@@ -33,13 +35,14 @@ pub enum ToolKind {
     Heal,
     Smudge,
     Blur,
+    Liquify,
     Ruler,
     Hand,
     Zoom,
 }
 
 impl ToolKind {
-    pub const ALL: [ToolKind; 22] = [
+    pub const ALL: [ToolKind; 23] = [
         ToolKind::Move,
         ToolKind::Transform,
         ToolKind::SelectRect,
@@ -59,6 +62,7 @@ impl ToolKind {
         ToolKind::Heal,
         ToolKind::Smudge,
         ToolKind::Blur,
+        ToolKind::Liquify,
         ToolKind::Ruler,
         ToolKind::Hand,
         ToolKind::Zoom,
@@ -85,6 +89,7 @@ impl ToolKind {
             ToolKind::Heal => "Healing Brush",
             ToolKind::Smudge => "Smudge",
             ToolKind::Blur => "Blur",
+            ToolKind::Liquify => "Liquify",
             ToolKind::Ruler => "Ruler",
             ToolKind::Hand => "Hand",
             ToolKind::Zoom => "Zoom",
@@ -229,6 +234,10 @@ pub trait Tool: Send + std::any::Any {
     fn busy(&self) -> bool {
         false
     }
+    /// Wants periodic [`Tool::tick`]s (pointer held down); defaults to `busy`.
+    fn ticking(&self) -> bool {
+        self.busy()
+    }
     /// Abort any in-progress interaction.
     fn reset(&mut self) {}
 }
@@ -254,6 +263,7 @@ pub fn make_tool(kind: ToolKind) -> Box<dyn Tool> {
         ToolKind::Heal => Box::new(CloneTool::new(true)),
         ToolKind::Smudge => Box::new(RetouchTool::new(false)),
         ToolKind::Blur => Box::new(RetouchTool::new(true)),
+        ToolKind::Liquify => Box::new(LiquifyTool::default()),
         ToolKind::Ruler => Box::new(RulerTool::default()),
         ToolKind::Hand => Box::new(HandTool::default()),
         ToolKind::Zoom => Box::new(ZoomTool),

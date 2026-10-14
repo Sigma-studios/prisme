@@ -8,7 +8,9 @@
 //! `export-sel:PATH` (Export Selection) · `action:<Action debug name>` (e.g. `action:CopyMerged`) ·
 //! `clip:PATH` (internal clipboard as PNG, export settings) ·
 //! `save:PATH` (.prisme) · `undo` · `redo` · `toggle-nodes` · `hdr:auto|on|off` (persisted setting) ·
-//! `hdr-status` (log surface format / colour space / headroom) · `quit`.
+//! `hdr-status` (log surface format / colour space / headroom) · `liquify-mode:forward|bloat|pucker|twirl-cw|…`
+//! (`LiquifyMode::id`) · `hold:x,y,SECONDS` (press and hold still, ticking the tool at 30 Hz: stationary
+//! liquify modes, airbrush) · `quit`.
 
 use crate::app::AppState;
 use prisme_tools::{Phase, ToolInput, ToolKey, ToolKind};
@@ -41,6 +43,18 @@ fn ev(phase: Phase, pos: [f32; 2], t: f64) -> ToolInput {
     let mut e = ToolInput::mouse(phase, pos);
     e.time = t;
     e
+}
+
+/// One tool tick (what the canvas does every frame while the pointer is held).
+fn tick(s: &mut AppState, time: f64) {
+    let (fg, bg, opts, tool) = (s.settings.fg, s.settings.bg, s.settings.tools.clone(), s.tool);
+    let (Some(t), Some(d), Some(g)) = (s.tools.get_mut(&tool), s.docs.get_mut(s.active), s.gpu.as_mut()) else { return };
+    let Some(w) = d.working.as_mut() else { return };
+    let mut ops = vec![];
+    let mut cx = prisme_tools::ToolCx { doc: w, opts: &opts, fg, bg, strokes: Some(&mut ops), view: d.view_rect };
+    t.tick(&mut cx, time);
+    crate::stroke::feed(d, &mut g.engine, ops);
+    d.touch();
 }
 
 pub fn step(s: &mut AppState, sc: &mut Script, ctx: &egui::Context) {
@@ -162,7 +176,21 @@ pub fn step(s: &mut AppState, sc: &mut Script, ctx: &egui::Context) {
                 s.settings.tools.eraser.size = v;
                 s.settings.tools.clone_brush.size = v;
                 s.settings.tools.retouch_brush.size = v;
+                s.settings.tools.liquify.size = v;
             }
+        }
+        "liquify-mode" => match prisme_tools::LiquifyMode::ALL.iter().find(|m| m.id() == arg) {
+            Some(m) => s.settings.tools.liquify.mode = *m,
+            None => log::warn!("script: unknown liquify mode {arg}"),
+        },
+        "hold" => {
+            let n = nums(arg);
+            crate::canvas::run_tool(s, ev(Phase::Down, [n[0], n[1]], t));
+            let ticks = (n.get(2).copied().unwrap_or(1.0) * 30.0) as usize;
+            for i in 1..=ticks {
+                tick(s, t + i as f64 / 30.0);
+            }
+            crate::canvas::run_tool(s, ev(Phase::Up, [n[0], n[1]], t + ticks as f64 / 30.0));
         }
         "altclick" => {
             let n = nums(arg);

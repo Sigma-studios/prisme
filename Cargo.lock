@@ -3568,6 +3568,7 @@ dependencies = [
  "egui-wgpu",
  "egui_dock",
  "log",
+ "pollster 0.4.0",
  "postcard",
  "prisme-brush",
  "prisme-color",

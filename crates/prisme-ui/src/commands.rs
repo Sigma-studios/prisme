@@ -97,7 +97,7 @@ pub fn script_key(s: &mut AppState, key: &ToolKey) {
 }
 
 /// Send a key to the active tool. Returns true if it was handled.
-fn tool_key(s: &mut AppState, key: &ToolKey) -> bool {
+pub fn tool_key(s: &mut AppState, key: &ToolKey) -> bool {
     let tool_kind = s.tool;
     let fg = s.settings.fg;
     let bg = s.settings.bg;
@@ -111,10 +111,15 @@ fn tool_key(s: &mut AppState, key: &ToolKey) -> bool {
     if !had_working {
         d.working = Some(d.history.current().clone());
     }
+    let mut ops = vec![];
+    let gpu = s.gpu.as_mut();
     let out = {
-        let mut cx = ToolCx { doc: d.working.as_mut().unwrap(), opts: &opts, fg, bg, strokes: None, view: d.view_rect };
+        let mut cx = ToolCx { doc: d.working.as_mut().unwrap(), opts: &opts, fg, bg, strokes: gpu.is_some().then_some(&mut ops), view: d.view_rect };
         tool.key(&mut cx, key)
     };
+    if let Some(g) = gpu {
+        crate::stroke::feed(d, &mut g.engine, ops);
+    }
     let busy = tool.busy();
     let handled = out != ToolOutcome::None;
     if !handled && !had_working {
@@ -126,6 +131,13 @@ fn tool_key(s: &mut AppState, key: &ToolKey) -> bool {
 }
 
 pub fn run_action(s: &mut AppState, a: Action, ctx: &egui::Context) {
+    // Liquify steps back its own strokes; anything touching the document applies the session.
+    if matches!(a, Action::Undo | Action::Redo) && tool_key(s, if a == Action::Undo { &ToolKey::Undo } else { &ToolKey::Redo }) {
+        return;
+    }
+    if !a.view_only() {
+        crate::stroke::commit_liquify(s);
+    }
     // Actions see the document with any finished GPU stroke landed.
     if let Some(d) = s.doc_mut() {
         d.finish_stroke();
@@ -240,6 +252,10 @@ pub fn run_action(s: &mut AppState, a: Action, ctx: &egui::Context) {
         Action::BrushSmaller | Action::BrushBigger => {
             let k = if a == Action::BrushBigger { 1.2 } else { 1.0 / 1.2 };
             let o = &mut s.settings.tools;
+            if s.tool == ToolKind::Liquify {
+                o.liquify.size = (o.liquify.size * k).clamp(1.0, 2000.0).round();
+                return;
+            }
             let b = match s.tool {
                 ToolKind::Eraser => &mut o.eraser,
                 ToolKind::Clone | ToolKind::Heal => &mut o.clone_brush,
@@ -287,6 +303,9 @@ pub fn edit(s: &mut AppState, label: &str, f: impl FnOnce(&mut Document)) {
 pub fn close_doc(s: &mut AppState, i: usize) {
     if i >= s.docs.len() {
         return;
+    }
+    if i == s.active {
+        crate::stroke::commit_liquify(s);
     }
     s.docs[i].finish_stroke();
     if s.docs[i].is_dirty() && s.dialogs.confirm_close != Some(i) {

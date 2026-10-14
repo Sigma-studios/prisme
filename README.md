@@ -22,7 +22,7 @@ cargo test --workspace --release                          # tests (GPU tests use
 | `prisme-io` | Decoders (PNG, JPEG, WebP, GIF, BMP, ICO, TGA, QOI, PNM, HDR, TIFF, JXL, EXR, AVIF, camera RAW, SVG; HEIC behind a feature) and the `.prisme` container (chunked, LZ4, deduplicated tiles, full history). |
 | `prisme-export` | PNG export: bit depth/colour mode/palette (quantette), dithering, filters, interlace, oxipng/zopfli, ICC/cICP tagging, explicit resize, target-file-size search with optional resolution reduction. |
 | `prisme-brush` | Dab brush engine: tablet-ready dynamics and dab placement, presets, stroke-buffer semantics (opacity caps the stroke, flow builds up). Dabs are rasterized/composited on the GPU (`prisme-gpu`), read back and landed in the tiles as one history edit when the stroke ends; the CPU compositor is the reference/fallback. |
-| `prisme-tools` | Tool state machines (selection, paint, fill, gradient, transform, crop, text, picker, clone/heal, smudge/blur, ruler…) and their pixel algorithms. |
+| `prisme-tools` | Tool state machines (selection, paint, fill, gradient, transform, crop, text, picker, clone/heal, smudge/blur, liquify, ruler…) and their pixel algorithms. |
 | `prisme-text` | Fonts (system + bundled + user), shaping, 2D effects, warps, 3D extrusion on a sphere. |
 | `prisme-vector` | SVG layers rendered from source at any zoom. |
 | `prisme-platform` | Platform services: async file dialogs, clipboard, screen colour picker, display ICC, storage, task spawning. |
@@ -63,7 +63,8 @@ WebGPU browser with module-worker support (all current WebGPU browsers have it).
 
 ### Automation
 `PRISME_SCRIPT="open:img.jpg;node:levels;param:m.gamma=1.3;export:out.png;quit"` drives the desktop app for
-end-to-end checks; `tool:Brush;stroke:x0,y0,x1,y1,…` paints, `new-infinite:W,H` makes an infinite canvas,
+end-to-end checks; `tool:Brush;stroke:x0,y0,x1,y1,…` paints, `tool:Liquify;liquify-mode:bloat;hold:x,y,1.5;key:Enter` liquifies,
+`new-infinite:W,H` makes an infinite canvas,
 `export-sel:out.png` / `action:CopyMerged;clip:out.png` export / copy the selection (see `crates/prisme-ui/src/script.rs`).
 
 ### Infinite canvas

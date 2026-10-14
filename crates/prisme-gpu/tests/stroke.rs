@@ -65,7 +65,7 @@ fn gpu(e: &mut Engine, d: &Document, sp: &StrokeSpec, dabs: &[Dab]) -> Document 
     let mut out = d.clone();
     let mut tiles = HashSet::new();
     dab_tiles(dabs, &mut tiles);
-    assert!(write_stroke(&mut out, sp, rb.rect, &px, sp.base.channels as usize, &tiles), "layout mismatch");
+    assert!(write_stroke(&mut out, sp.target, sp.base_default, rb.rect, &px, sp.base.channels as usize, &tiles), "layout mismatch");
     out
 }
 

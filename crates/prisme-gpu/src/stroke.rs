@@ -13,6 +13,12 @@
 //! previous dab, so they run one dab per dispatch, sampling `live` (and `base` for the
 //! clone source) instead of CPU tiles; the weighted means smudge/heal need are reduced on
 //! the GPU too.
+//!
+//! A Liquify session is a stroke too ([`Engine::liquify_begin`]): `base` covers the whole
+//! working area, the displacement field (painted on the CPU, `prisme_tools::liquify`) lives
+//! in a node texture updated in place, and there is no `live` texture: evaluation warps
+//! `base` through the field directly at the requested level (`k_liquify`), and the bake
+//! renders it bicubic at full resolution for the readback.
 
 use crate::engine::Engine;
 use crate::image::{GpuImage, PooledTex};
@@ -137,7 +143,9 @@ impl Snapshot {
 pub struct GpuStroke {
     /// The upload this stroke replaces during evaluation (layer pixels, layer mask, saved mask).
     pub key: UploadKey,
-    mode: StrokeMode,
+    /// None for a Liquify session.
+    mode: Option<StrokeMode>,
+    liquify: Option<Liquify>,
     channels: u8,
     base: Snapshot,
     sel: Option<Snapshot>,
@@ -202,7 +210,7 @@ impl GpuStroke {
             copy(enc, l, &live, old);
         }
         self.live = Some(live);
-        if matches!(self.mode, StrokeMode::Paint { .. }) {
+        if matches!(self.mode, Some(StrokeMode::Paint { .. })) {
             let cov = texture(device, want, wgpu::TextureFormat::R32Float);
             if let Some(c) = &self.cov {
                 copy(enc, c, &cov, old);
@@ -259,7 +267,8 @@ impl Engine {
         let src = matches!(mode, StrokeMode::Retouch(RetouchMode::Clone { .. } | RetouchMode::Heal { .. })).then(|| Snapshot::new(base.clone(), base_default));
         GpuStroke {
             key,
-            mode,
+            mode: Some(mode),
+            liquify: None,
             channels,
             base: Snapshot::new(base, base_default),
             sel: selection.map(|s| Snapshot::new(s, 0.0)),
@@ -278,11 +287,9 @@ impl Engine {
         for d in dabs {
             s.dirty = s.dirty.union(&dab_rect(d));
         }
-        if dabs.is_empty() || s.overflow {
-            return;
-        }
+        let Some(mode) = s.mode.filter(|_| !dabs.is_empty() && !s.overflow) else { return };
         let mut enc = self.ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("stroke") });
-        match s.mode {
+        match mode {
             StrokeMode::Paint { target, opacity, lock_alpha } => {
                 for chunk in dabs.chunks(BATCH) {
                     self.paint_batch(&mut enc, s, chunk, target, opacity, lock_alpha);
@@ -365,5 +372,124 @@ impl Engine {
             return None;
         }
         Some(Readback::start(&self.ctx.device, &self.ctx.queue, live, r))
+    }
+}
+
+/// Liquify session state (see the module docs).
+struct Liquify {
+    /// Field nodes `(dx, dy, freeze, 0)`; rect = node indices.
+    field: GpuImage,
+    /// Working area (document px).
+    rect: IRect,
+    step: i32,
+    show_mask: bool,
+}
+
+impl GpuStroke {
+    pub fn is_liquify(&self) -> bool {
+        self.liquify.is_some()
+    }
+
+    /// `k_liquify` inputs (base, field, selection) and params for level scale `k`.
+    pub(crate) fn liquify_args(&self, k: i32, bicubic: bool, default: f32) -> Option<([GpuImage; 2], Option<GpuImage>, Vec<f32>)> {
+        let l = self.liquify.as_ref().filter(|_| !self.overflow)?;
+        let base = self.base.img.clone()?;
+        let sel = self.sel.as_ref().and_then(|s| s.img.clone());
+        let r = l.rect;
+        let show = l.show_mask && !bicubic;
+        let p = vec![k as f32, l.step as f32, show as i32 as f32, bicubic as i32 as f32, r.x0 as f32, r.y0 as f32, r.x1 as f32, r.y1 as f32, default];
+        Some(([base, l.field.clone()], sel, p))
+    }
+
+    /// Working area of a Liquify session.
+    pub fn liquify_rect(&self) -> IRect {
+        self.liquify.as_ref().map(|l| l.rect).unwrap_or(IRect::EMPTY)
+    }
+}
+
+impl Engine {
+    /// Start a Liquify session on `base` (layer pixels, missing tiles transparent) over the
+    /// working area `rect`, with a `nodes` field of `step` px per node.
+    pub fn liquify_begin(&mut self, key: UploadKey, base: Arc<TileGrid>, selection: Option<Arc<TileGrid>>, rect: IRect, step: i32, nodes: [i32; 2]) -> GpuStroke {
+        let (device, queue) = (self.ctx.device.clone(), self.ctx.queue.clone());
+        let channels = base.channels;
+        let field = texture(&device, IRect::new(0, 0, nodes[0], nodes[1]), wgpu::TextureFormat::Rgba32Float);
+        let mut s = GpuStroke {
+            key,
+            mode: None,
+            liquify: Some(Liquify { field, rect, step, show_mask: false }),
+            channels,
+            base: Snapshot::new(base, 0.0),
+            sel: selection.map(|s| Snapshot::new(s, 0.0)),
+            src: None,
+            live: None,
+            cov: None,
+            carried: None,
+            dirty: IRect::EMPTY,
+            generation: 0,
+            overflow: false,
+        };
+        let want = align(rect);
+        let max = device.limits().max_texture_dimension_2d as i32;
+        if want.width() > max || want.height() > max || nodes[0] > max || nodes[1] > max {
+            log::warn!("liquify area {want:?} exceeds texture limits; no GPU preview");
+            s.overflow = true;
+            return s;
+        }
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("liquify") });
+        s.base.grow(&device, &queue, &mut enc, want);
+        if let Some(sel) = &mut s.sel {
+            sel.grow(&device, &queue, &mut enc, want);
+        }
+        queue.submit([enc.finish()]);
+        s
+    }
+
+    /// Upload changed field nodes (`nodes` rect, row-major values).
+    pub fn liquify_update(&mut self, s: &mut GpuStroke, nodes: IRect, data: &[[f32; 4]]) {
+        let Some(l) = &s.liquify else { return };
+        if nodes.is_empty() || nodes.intersect(&l.field.rect) != nodes || data.len() != nodes.area() as usize {
+            return;
+        }
+        self.ctx.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &l.field.tex.tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x: nodes.x0 as u32, y: nodes.y0 as u32, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytemuck::cast_slice(data),
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(nodes.width() as u32 * 16), rows_per_image: Some(nodes.height() as u32) },
+            wgpu::Extent3d { width: nodes.width() as u32, height: nodes.height() as u32, depth_or_array_layers: 1 },
+        );
+        s.generation += 1;
+    }
+
+    /// Tint frozen areas in the preview. True if it changed.
+    pub fn liquify_show_mask(&mut self, s: &mut GpuStroke, on: bool) -> bool {
+        match &mut s.liquify {
+            Some(l) if l.show_mask != on => {
+                l.show_mask = on;
+                s.generation += 1;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Render the warped layer over `rect` (document px; bicubic for the bake, bilinear
+    /// like the preview otherwise) and start reading it back. None on overflow (bake on the
+    /// CPU instead).
+    pub fn liquify_readback(&mut self, s: &GpuStroke, rect: IRect, bicubic: bool) -> Option<Readback> {
+        let rect = rect.intersect(&s.liquify_rect());
+        let ([base, field], sel, p) = s.liquify_args(1, bicubic, 0.0)?;
+        if rect.is_empty() {
+            return None;
+        }
+        let mut enc = self.ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("liquify-bake") });
+        let out = self.pool.image(rect, wgpu::TextureFormat::Rgba32Float);
+        self.kernels.dispatch(&mut enc, "k_liquify", &out, None, [None, Some(&base), Some(&field), sel.as_ref()], &p, None, &G);
+        self.ctx.queue.submit([enc.finish()]);
+        Some(Readback::start(&self.ctx.device, &self.ctx.queue, &out, rect))
     }
 }

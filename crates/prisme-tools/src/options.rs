@@ -47,6 +47,9 @@ pub struct ToolOptions {
     pub picker_sample_size: u32,
     // move
     pub move_auto_select: bool,
+    // liquify
+    #[serde(default)]
+    pub liquify: crate::LiquifyOptions,
 }
 
 impl Default for ToolOptions {
@@ -83,6 +86,7 @@ impl Default for ToolOptions {
             crop_delete_outside: false,
             picker_sample_size: 1,
             move_auto_select: false,
+            liquify: Default::default(),
         }
     }
 }

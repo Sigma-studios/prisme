@@ -80,6 +80,17 @@ impl Action {
     /// Display order of `category()` groups.
     pub const CATEGORIES: [&'static str; 9] = ["Tools", "File", "Edit", "Select", "Layer", "Image", "View", "Color", "App"];
 
+    /// Doesn't touch the document (view, colours, tool settings): an open Liquify session
+    /// stays open across it.
+    pub fn view_only(&self) -> bool {
+        use Action::*;
+        matches!(
+            self,
+            Undo | Redo | ZoomIn | ZoomOut | ZoomFit | Zoom100 | RotateViewLeft | RotateViewRight | ResetView | ToggleNodeOutput | SwapColors
+                | ResetColors | BrushSmaller | BrushBigger | PickScreenColor | Preferences | Tool(_)
+        )
+    }
+
     pub fn category(&self) -> &'static str {
         use Action::*;
         match self {
@@ -245,6 +256,7 @@ impl Default for Keymap {
         add(Tool(ToolKind::PolyLasso), Binding::shift(Key::L));
         add(Tool(ToolKind::ColorSelect), Binding::shift(Key::W));
         add(Tool(ToolKind::Blur), Binding::shift(Key::R));
+        add(Tool(ToolKind::Liquify), Binding::cmd_shift(Key::X));
         Keymap { bindings: m }
     }
 }

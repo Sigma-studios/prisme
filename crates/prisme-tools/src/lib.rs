@@ -8,6 +8,7 @@
 
 pub mod flatten;
 pub mod input;
+pub mod liquify;
 pub mod options;
 pub mod paint;
 pub mod region;
@@ -15,6 +16,7 @@ pub mod stroke;
 pub mod tools;
 pub mod transform;
 
+pub use liquify::{LiquifyMode, LiquifyOptions, LiquifySpec};
 pub use input::{Modifiers, Phase, PointerKind, ToolInput, ToolKey};
 pub use options::ToolOptions;
 pub use stroke::{PaintTarget, StrokeOp, StrokeSpec};

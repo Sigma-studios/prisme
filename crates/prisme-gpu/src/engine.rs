@@ -824,9 +824,25 @@ impl Engine {
         let f32 = f.format == EvalFormat::F32;
         let img = self.uploads.get(&self.ctx.device, &self.ctx.queue, &mut self.mips, key, grid, f.mip, rect, f32, default);
         match f.stroke {
+            Some(s) if s.key == key && s.is_liquify() => self.liquify_view(f, s, img, rect, default),
             Some(s) if s.key == key => self.stroke_view(f, s, img, rect, default),
             _ => img,
         }
+    }
+
+    /// The upload warped by a Liquify session inside its working area.
+    fn liquify_view(&mut self, f: &mut Frame, s: &GpuStroke, regular: Option<GpuImage>, rect: IRect, default: f32) -> Option<GpuImage> {
+        let k = 1i32 << f.mip;
+        let Some(([base, field], sel, p)) = s.liquify_args(k, false, default) else { return regular };
+        let lr = s.liquify_rect();
+        let level = IRect::new(lr.x0.div_euclid(k), lr.y0.div_euclid(k), (lr.x1 + k - 1).div_euclid(k), (lr.y1 + k - 1).div_euclid(k));
+        if level.intersect(&rect).is_empty() {
+            return regular;
+        }
+        let mut out = self.new_image(f, rect);
+        self.run(f, "k_liquify", &out, [regular.as_ref(), Some(&base), Some(&field), sel.as_ref()], &p, None);
+        out.straight = true;
+        Some(out)
     }
 
     /// The upload with the live stroke spliced in (block-averaged at mip > 0).
