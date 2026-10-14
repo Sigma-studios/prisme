@@ -8,6 +8,11 @@ mod web {
     pub fn start() {
         console_error_panic_hook::set_once();
         wasm_logger::init(wasm_logger::Config::new(log::Level::Info));
+        // The same wasm also runs inside the job Web Workers (see `worker.js`): there, serve
+        // job requests instead of starting the UI.
+        if prisme_ui::offload::worker_entry() {
+            return;
+        }
         wasm_bindgen_futures::spawn_local(async {
             let window = web_sys::window().expect("no window");
             let document = window.document().expect("no document");

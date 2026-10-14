@@ -36,6 +36,31 @@ The document graph ends in a single **Output** node; by default `Layer Stack →
 individual layers into processing chains and **Blend** nodes to recombine (blending is explicit). Destructive edits
 (painting, fill…) modify layer pixels directly. `\` toggles the view between node output and the raw layer stack.
 
+### Background jobs and the web build
+Heavy CPU work goes through `prisme_platform::spawn_worker(job)` (jobs live in `crates/prisme-ui/src/offload.rs`):
+decoding images on open/place (colour conversion and tile building included), `.prisme` load/save and autosave
+encoding, and PNG export encoding (quantization, oxipng/zopfli, target-size search, with progress and Cancel).
+It returns a `Task` (a `Pending` result plus a `JobControl` for progress/cancellation) on every target:
+
+* **Native**: the job runs on an OS thread (Rayon inside, as before).
+* **Web**: the job runs in a **Web Worker**, without shared memory (no `SharedArrayBuffer`, no COOP/COEP headers,
+  stable toolchain). Each worker runs its own instance of the *same* `prisme-web` wasm: `apps/prisme-web/worker.js`
+  imports the wasm-bindgen glue and the page posts it the already compiled `WebAssembly.Module`, so nothing is
+  downloaded or compiled twice; the wasm `start` function notices it runs in a worker and serves jobs instead of
+  starting the UI. Requests and replies are a small postcard header plus raw `ArrayBuffer`s moved with
+  `postMessage` transfer lists (pixels as raw `f32`, documents as uncompressed tiles via
+  `prisme_io::container::to_transport`). Workers form a lazily grown pool of `min(hardwareConcurrency − 1, 4)`
+  (several files decode in parallel, an export can encode while a project saves); a worker whose wasm memory grew past
+  256 MB is retired after its job since wasm memory never shrinks. Cancelling an export terminates its worker. If
+  workers can't be created (CSP, missing `worker.js`…), jobs fall back to running on the UI thread through the same
+  message path. The export size *estimate* still runs on the UI thread on the web (it only encodes a sampled mosaic).
+
+`trunk build --release` in `apps/prisme-web` produces a self-contained `dist/` with relative URLs only
+(`public_url = "./"`, `filehash = false` so `worker.js` can import `./prisme-web.js` / `./prisme-web_bg.wasm`):
+`index.html`, `prisme-web.js`, `prisme-web_bg.wasm`, `worker.js` (plus `snippets/`). Zip the contents of `dist/` and
+upload it as an HTML game on itch.io (or any static host, any subpath); no special headers are needed. It needs a
+WebGPU browser with module-worker support (all current WebGPU browsers have it).
+
 ### Automation
 `PRISME_SCRIPT="open:img.jpg;node:levels;param:m.gamma=1.3;export:out.png;quit"` drives the desktop app for
 end-to-end checks (see `crates/prisme-ui/src/script.rs`).

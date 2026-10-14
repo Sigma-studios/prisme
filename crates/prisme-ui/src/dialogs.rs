@@ -381,7 +381,17 @@ fn export(s: &mut AppState, ctx: &egui::Context) {
             }
             if encoding {
                 ui.spinner();
-                ui.label("Encoding…");
+                let progress = s.jobs.iter().find_map(|j| match j {
+                    crate::jobs::Job::Encode { control, .. } => control.progress(),
+                    _ => None,
+                });
+                match progress {
+                    Some((f, stage)) => ui.label(format!("{stage}… {:.0}%", f * 100.0)),
+                    None => ui.label("Encoding…"),
+                };
+                if ui.button("Cancel").clicked() {
+                    crate::jobs::cancel_encode(s);
+                }
             }
             if ui.button("Re-render").on_hover_text("Re-render the image (after edits)").clicked() {
                 crate::jobs::start_render(s, false);

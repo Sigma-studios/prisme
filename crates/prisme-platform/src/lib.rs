@@ -11,6 +11,7 @@
 //! | Feature | macOS | Windows | Linux X11 | Linux Wayland | Web |
 //! |---|---|---|---|---|---|
 //! | [`spawn`] / [`spawn_async`] | thread | thread | thread | thread | microtask / `spawn_local` |
+//! | [`spawn_worker`] (heavy CPU jobs) | thread | thread | thread | thread | Web Worker pool (fallback: microtask) |
 //! | [`open_files`] | rfd (sheet) | rfd | rfd (portal/GTK-less) | rfd (portal) | rfd (`<input type=file>`) |
 //! | [`save_file`] | rfd + write | rfd + write | rfd + write | rfd + write | `showSaveFilePicker` (Chromium), else `<a download>` |
 //! | [`write_file_path`] | yes | yes | yes | yes | error (no paths) |
@@ -43,6 +44,7 @@ mod clipboard;
 mod files;
 mod pending;
 mod storage;
+mod worker;
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -57,9 +59,15 @@ pub use clipboard::{
     ClipboardImage, clipboard_get_image, clipboard_get_text, clipboard_set_image,
     clipboard_set_text, decode_png, encode_png,
 };
-pub use files::{FileFilter, PickedFile, open_files, save_file, write_file_path};
+pub use files::{
+    FileFilter, PickedFile, open_files, save_file, save_file_deferred, write_file_path,
+};
 pub use pending::{
-    Completer, MaybeSend, Pending, pending_pair, set_wake_callback, spawn, spawn_async,
+    Completer, MaybeSend, Pending, Wait, pending_pair, set_wake_callback, spawn, spawn_async,
+};
+pub use worker::{
+    Buffer, JobControl, JobCtx, RETIRE_BYTES, Task, WorkerHandler, WorkerJob, WorkerMsg,
+    run_via_messages, spawn_job, spawn_worker, worker_entry, worker_parallelism,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use storage::storage_dir;

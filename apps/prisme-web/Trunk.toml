@@ -1,4 +1,7 @@
 [build]
 target = "index.html"
 release = true
+# Relative URLs everywhere: the build works from any subpath (e.g. an itch.io iframe).
 public_url = "./"
+# Stable file names: worker.js imports ./prisme-web.js and ./prisme-web_bg.wasm directly.
+filehash = false

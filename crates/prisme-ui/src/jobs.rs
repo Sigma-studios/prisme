@@ -3,16 +3,14 @@
 
 use crate::app::AppState;
 use crate::doc::DocState;
-use prisme_core::{Document, History, IRect, NodeId};
+use prisme_core::{Document, IRect, NodeId};
 use prisme_gpu::{EvalFormat, EvalRequest, Readback, RenderSource};
 use prisme_platform::{FileFilter, Pending, PickedFile};
 use std::sync::Arc;
 
-pub enum Loaded {
-    Doc(Document),
-    History(History),
-    Place(prisme_io::Decoded),
-}
+pub use crate::offload::Loaded;
+use crate::offload::{DecodeJob, EncodePngJob, SaveJob};
+use prisme_platform::JobControl;
 
 pub enum Job {
     OpenDialog { pending: Pending<Vec<PickedFile>>, place: bool },
@@ -24,10 +22,11 @@ pub enum Job {
     FontFiles(Pending<Vec<PickedFile>>),
     LutFile { pending: Pending<Vec<PickedFile>>, doc: u64, node: NodeId, key: String },
     Render(RenderJob),
-    Encode { pending: Pending<Result<prisme_export::ExportResult, String>>, name: String },
+    Encode { pending: Pending<Result<prisme_export::ExportResult, String>>, control: JobControl, name: String },
     Estimate(Pending<u64>),
     Autosave(Pending<Result<(), String>>),
     Recover(Pending<Option<Vec<u8>>>),
+    RecoverLoad(Pending<Result<Loaded, String>>),
     Dropped { pending: Pending<Result<Vec<u8>, String>>, name: String, into: Option<u64> },
 }
 
@@ -36,7 +35,10 @@ pub fn describe(jobs: &[Job]) -> String {
         .map(|j| match j {
             Job::Decode { name, .. } => format!("Opening {name}"),
             Job::Render(r) => format!("Rendering {:.0}%", r.next as f32 / r.tiles.len().max(1) as f32 * 100.0),
-            Job::Encode { .. } => "Encoding PNG".into(),
+            Job::Encode { control, .. } => match control.progress() {
+                Some((f, stage)) => format!("Encoding PNG {:.0}% ({stage})", f * 100.0),
+                None => "Encoding PNG".into(),
+            },
             Job::Save { .. } => "Saving".into(),
             Job::Estimate(_) => "Estimating size".into(),
             _ => String::new(),
@@ -88,18 +90,9 @@ pub fn decode_file(s: &mut AppState, name: String, bytes: Vec<u8>, into: Option<
             s.add_doc(ds);
         }
     }
-    let n2 = name.clone();
-    let pending = prisme_platform::spawn(move || -> Result<Loaded, String> {
-        if project {
-            return prisme_io::container::load(&bytes).map(Loaded::History).map_err(|e| e.to_string());
-        }
-        let decoded = prisme_io::decode(&bytes, &n2).map_err(|e| e.to_string())?;
-        if into.is_some() {
-            Ok(Loaded::Place(decoded))
-        } else {
-            Ok(Loaded::Doc(prisme_io::document_from_decoded(&n2, decoded)))
-        }
-    });
+    // Decoding (and building tiles) runs on a thread natively, in a Web Worker on the web.
+    let place_into = into.and_then(|id| s.docs.iter().find(|d| d.id == id)).map(|d| (d.doc().info.width, d.doc().info.height));
+    let pending = prisme_platform::spawn_worker(DecodeJob { name: name.clone(), bytes, place_into }).pending;
     s.jobs.push(Job::Decode { name, pending, into, placeholder, path });
 }
 
@@ -109,45 +102,31 @@ pub fn save(s: &mut AppState, save_as: bool) {
     }
 }
 
-/// Save document `i`. Returns false when nothing was started (bad index or encode error).
+/// Save document `i` (encoded in the background). Returns false when nothing was started.
 pub fn save_doc(s: &mut AppState, i: usize, save_as: bool) -> bool {
     let Some(d) = s.docs.get(i) else { return false };
-    let id = d.id;
-    let preview = None;
-    let bytes = match prisme_io::container::save_with_preview(&d.history, true, preview) {
-        Ok(b) => b,
-        Err(e) => {
-            s.toast(format!("Save failed: {e}"));
-            save_failed(s, id);
-            return false;
-        }
-    };
     let (doc_id, rev) = (d.id, d.history.revision());
+    // Encoding runs in the background (thread / Web Worker); the history clone is cheap.
+    let encoded = prisme_platform::spawn_worker(SaveJob { history: d.history.clone(), include_history: true }).pending;
     #[cfg(not(target_arch = "wasm32"))]
     if !save_as
         && let Some(p) = &d.path
-            && p.extension().is_some_and(|e| e == "prisme") {
-                match prisme_platform::write_file_path(p, &bytes) {
-                    Ok(()) => {
-                        let msg = format!("Saved {}", p.display());
-                        let path = p.clone();
-                        add_recent(s, &path);
-                        if let Some(d) = s.docs.iter_mut().find(|d| d.id == doc_id) {
-                            d.saved_revision = rev;
-                        }
-                        s.toast(msg);
-                        saved(s, doc_id);
-                    }
-                    Err(e) => {
-                        s.toast(format!("Save failed: {e}"));
-                        save_failed(s, doc_id);
-                    }
-                }
-                return true;
-            }
+        && p.extension().is_some_and(|e| e == "prisme")
+    {
+        let path = p.clone();
+        let pending = prisme_platform::spawn(move || {
+            let bytes = encoded.block().unwrap_or_else(|| Err("encoder crashed".into()))?;
+            prisme_platform::write_file_path(&path, &bytes)?;
+            Ok(Some(path.display().to_string()))
+        });
+        s.jobs.push(Job::Save { pending, doc: doc_id, revision: rev });
+        return true;
+    }
     let _ = save_as;
     let name = format!("{}.prisme", d.doc().info.name.trim_end_matches(".prisme"));
-    let pending = prisme_platform::save_file("Save project", &name, &[FileFilter::new("Prisme project", &["prisme"])], bytes);
+    // The dialog opens now (inside the user gesture on the web); the file is written once
+    // the bytes are ready.
+    let pending = prisme_platform::save_file_deferred("Save project", &name, &[FileFilter::new("Prisme project", &["prisme"])], encoded);
     s.jobs.push(Job::Save { pending, doc: doc_id, revision: rev });
     true
 }
@@ -286,10 +265,17 @@ fn step_render(s: &mut AppState, r: &mut RenderJob) -> bool {
 pub fn start_encode(s: &mut AppState, pixels: Arc<Vec<f32>>, w: u32, h: u32) {
     let opts = s.settings.export.clone();
     let name = s.doc().map(|d| d.doc().info.name.clone()).unwrap_or("image".into());
-    let pending = prisme_platform::spawn(move || {
-        prisme_export::encode_png(&pixels, w, h, &opts, &mut |_, _| {}, &|| false).map_err(|e| e.to_string())
-    });
-    s.jobs.push(Job::Encode { pending, name });
+    let task = prisme_platform::spawn_worker(EncodePngJob { pixels, width: w, height: h, opts });
+    s.jobs.push(Job::Encode { pending: task.pending, control: task.control, name });
+}
+
+/// Cancel a running PNG export encode.
+pub fn cancel_encode(s: &mut AppState) {
+    for j in &s.jobs {
+        if let Job::Encode { control, .. } = j {
+            control.cancel();
+        }
+    }
 }
 
 pub fn start_estimate(s: &mut AppState, pixels: Arc<Vec<f32>>, w: u32, h: u32) {
@@ -334,10 +320,10 @@ pub fn poll(s: &mut AppState, ctx: &egui::Context) {
                     match loaded {
                         Loaded::Doc(doc) => replace_or_add(s, placeholder, DocState::new(doc), path),
                         Loaded::History(h) => replace_or_add(s, placeholder, DocState::from_history(h), path),
-                        Loaded::Place(decoded) => {
+                        Loaded::Place(prepared) => {
                             if let Some(d) = s.docs.iter_mut().find(|d| Some(d.id) == into) {
                                 d.edit("Place", |doc| {
-                                    let ids = prisme_io::add_decoded_as_layers(doc, &name, decoded);
+                                    let ids = prisme_io::add_prepared_layers(doc, prepared);
                                     if let Some(l) = ids.last() {
                                         doc.active_layer = Some(*l);
                                     }
@@ -458,7 +444,7 @@ pub fn poll(s: &mut AppState, ctx: &egui::Context) {
                 }
                 ctx.request_repaint();
             }
-            Job::Encode { mut pending, name } => match pending.poll() {
+            Job::Encode { mut pending, control, name } => match pending.poll() {
                 Some(Ok(res)) => {
                     s.dialogs.export.last_result = Some(format!(
                         "{} × {} · {} · {:.1} KB{}",
@@ -473,9 +459,11 @@ pub fn poll(s: &mut AppState, ctx: &egui::Context) {
                     let p = prisme_platform::save_file("Export PNG", &file, &[FileFilter::new("PNG", &["png"])], res.bytes);
                     keep.push(Job::Save { pending: p, doc: u64::MAX, revision: 0 });
                 }
+                Some(Err(_)) if control.is_cancelled() => s.toast("Export cancelled"),
                 Some(Err(e)) => s.toast(format!("Export failed: {e}")),
+                None if pending.is_abandoned() && control.is_cancelled() => s.toast("Export cancelled"),
                 None if pending.is_abandoned() => s.toast("Export crashed"),
-                None => keep.push(Job::Encode { pending, name }),
+                None => keep.push(Job::Encode { pending, control, name }),
             },
             Job::Estimate(mut p) => match p.poll() {
                 Some(v) => s.dialogs.export.estimate = Some(v),
@@ -494,18 +482,25 @@ pub fn poll(s: &mut AppState, ctx: &egui::Context) {
                 None => {}
             },
             Job::Recover(mut p) => match p.poll() {
-                Some(Some(bytes)) => match prisme_io::container::load(&bytes) {
-                    Ok(h) => {
-                        let mut d = DocState::from_history(h);
-                        d.saved_revision = u64::MAX; // mark dirty
-                        s.add_doc(d);
-                        s.toast("Recovered document");
-                    }
-                    Err(e) => s.toast(format!("Recovery failed: {e}")),
-                },
+                Some(Some(bytes)) => {
+                    let job = DecodeJob { name: "autosave.prisme".into(), bytes, place_into: None };
+                    keep.push(Job::RecoverLoad(prisme_platform::spawn_worker(job).pending));
+                }
                 Some(None) => {}
                 None if !p.is_abandoned() => keep.push(Job::Recover(p)),
                 None => {}
+            },
+            Job::RecoverLoad(mut p) => match p.poll() {
+                Some(Ok(Loaded::History(h))) => {
+                    let mut d = DocState::from_history(h);
+                    d.saved_revision = u64::MAX; // mark dirty
+                    s.add_doc(d);
+                    s.toast("Recovered document");
+                }
+                Some(Ok(_)) => s.toast("Recovery failed: not a project"),
+                Some(Err(e)) => s.toast(format!("Recovery failed: {e}")),
+                None if p.is_abandoned() => s.toast("Recovery failed: loader crashed"),
+                None => keep.push(Job::RecoverLoad(p)),
             },
         }
     }
@@ -578,18 +573,17 @@ pub fn autosave(s: &mut AppState) {
             continue;
         }
         index.push((d.id, d.doc().info.name.clone()));
-        let h = d.history.clone();
         let key = format!("autosave/{}", d.id);
-        let pending = prisme_platform::spawn(move || {
-            let bytes = prisme_io::container::save(&h, false).map_err(|e| e.to_string())?;
+        let encoded = prisme_platform::spawn_worker(SaveJob { history: d.history.clone(), include_history: false }).pending;
+        let pending = prisme_platform::spawn_async(async move {
+            let bytes = encoded.wait().await.unwrap_or_else(|| Err("encoder crashed".into()))?;
             #[cfg(not(target_arch = "wasm32"))]
             {
                 prisme_platform::storage_write(&key, &bytes)
             }
             #[cfg(target_arch = "wasm32")]
             {
-                drop(prisme_platform::storage_write_large(&key, bytes));
-                Ok(())
+                prisme_platform::storage_write_large(&key, bytes).wait().await.unwrap_or(Ok(()))
             }
         });
         s.jobs.push(Job::Autosave(pending));

@@ -51,22 +51,33 @@ pub fn save_with_preview(
     include_history: bool,
     preview: Option<(u32, u32, &[u8])>,
 ) -> Result<Vec<u8>, IoError> {
-    let current_only;
+    let trimmed;
     let history = if include_history {
         history
     } else {
-        let e = &history.entries()[history.cursor()];
-        let entry = HistoryEntry { label: e.label.clone(), doc: e.doc.clone(), merge_key: None };
-        let mut h = History::from_parts(vec![entry], 0);
-        h.budget_bytes = history.budget_bytes;
-        current_only = h;
-        &current_only
+        trimmed = history_for_save(history, false);
+        &trimmed
     };
-
     let (doc, sink) = with_sink(|| postcard::to_allocvec(history));
     let doc = doc.map_err(|e| IoError::Encode(format!("document serialization: {e}")))?;
-    let tiles = encode_tiles(&sink.tiles);
+    assemble(doc, encode_tiles(&sink.tiles), preview)
+}
 
+/// The history that [`save`] writes: the whole history, or a single-state history holding
+/// only the current document when `include_history` is false (cheap: tiles are shared).
+pub fn history_for_save(history: &History, include_history: bool) -> History {
+    if include_history {
+        return history.clone();
+    }
+    let e = &history.entries()[history.cursor()];
+    let entry = HistoryEntry { label: e.label.clone(), doc: e.doc.clone(), merge_key: None };
+    let mut h = History::from_parts(vec![entry], 0);
+    h.budget_bytes = history.budget_bytes;
+    h
+}
+
+/// Write the container from a serialized `DOC` chunk and an encoded `TILE` chunk.
+fn assemble(doc: Vec<u8>, tiles: Vec<u8>, preview: Option<(u32, u32, &[u8])>) -> Result<Vec<u8>, IoError> {
     let mut chunks: Vec<([u8; 4], Vec<u8>)> = Vec::with_capacity(3);
     if let Some((w, h, rgba)) = preview {
         if rgba.len() != w as usize * h as usize * 4 {
@@ -203,14 +214,15 @@ fn unshuffle(planes: &[u8], width: usize) -> Vec<u8> {
 }
 
 fn encode_tile(t: &Tile) -> Vec<u8> {
-    let width = t.format().bytes_per_channel();
-    let data = lz4_flex::compress(&shuffle(&t.to_bytes(), width));
+    encode_tile_bytes(t.format(), t.channels(), &t.to_bytes())
+}
+
+fn encode_tile_bytes(format: PixelFormat, channels: u8, raw: &[u8]) -> Vec<u8> {
+    let width = format.bytes_per_channel();
+    let data = lz4_flex::compress(&shuffle(raw, width));
     let mut out = Vec::with_capacity(8 + data.len());
-    out.push(match t.format() {
-        PixelFormat::F16 => 0,
-        PixelFormat::F32 => 1,
-    });
-    out.push(t.channels());
+    out.push(format_code(format));
+    out.push(channels);
     out.push(FLAG_SHUFFLED);
     out.push(0);
     out.extend_from_slice(&(data.len() as u32).to_le_bytes());
@@ -285,6 +297,128 @@ fn decode_tiles(chunk: &[u8]) -> Result<Vec<Arc<Tile>>, IoError> {
     {
         raw.iter().map(decode_tile).collect()
     }
+}
+
+// --------------------------------------------------------------------------------
+// Transport (uncompressed, for handing documents to/from Web Workers)
+// --------------------------------------------------------------------------------
+
+/// A serde value split into a small postcard `doc` (tiles replaced by references) and a
+/// packed, *uncompressed* tile blob. Much cheaper to produce and consume than the `.prisme`
+/// container (no LZ4), and the tile blob can be handed to a Web Worker as a transferable
+/// buffer. Tiles shared between history states are stored once.
+///
+/// Tile blob layout: `count u32`, `count x {format u8, channels u8}`, then the raw
+/// little-endian samples of every tile back to back (each tile has a fixed size given by its
+/// format and channel count).
+pub struct Transport {
+    pub doc: Vec<u8>,
+    pub tiles: Vec<u8>,
+}
+
+/// Serialize any value containing tile grids (a [`Document`], a [`History`],
+/// [`crate::PreparedLayers`]…) into a [`Transport`].
+pub fn to_transport<T: serde::Serialize>(value: &T) -> Result<Transport, IoError> {
+    let (doc, sink) = with_sink(|| postcard::to_allocvec(value));
+    let doc = doc.map_err(|e| IoError::Encode(format!("serialization: {e}")))?;
+    let tiles = &sink.tiles;
+    let data_len: usize = tiles.iter().map(|t| t.byte_size()).sum();
+    let mut out = Vec::with_capacity(4 + tiles.len() * 2 + data_len);
+    out.extend_from_slice(&(tiles.len() as u32).to_le_bytes());
+    for t in tiles {
+        out.push(format_code(t.format()));
+        out.push(t.channels());
+    }
+    for t in tiles {
+        append_tile_bytes(&mut out, t);
+    }
+    Ok(Transport { doc, tiles: out })
+}
+
+/// Inverse of [`to_transport`].
+pub fn from_transport<T: serde::de::DeserializeOwned>(doc: &[u8], tiles: &[u8]) -> Result<T, IoError> {
+    let raw = parse_transport_tiles(tiles)?;
+    let tiles: Vec<Arc<Tile>> = raw
+        .iter()
+        .map(|(f, c, data)| Tile::from_bytes(*f, *c, data).map(Arc::new).ok_or_else(|| corrupt("bad tile")))
+        .collect::<Result<_, _>>()?;
+    struct Source(Vec<Arc<Tile>>);
+    impl TileSource for Source {
+        fn get(&self, index: u32) -> Option<Arc<Tile>> {
+            self.0.get(index as usize).cloned()
+        }
+    }
+    with_source(Box::new(Source(tiles)), || postcard::from_bytes(doc)).map_err(|e| corrupt(format!("transport: {e}")))
+}
+
+/// Write a `.prisme` container straight from the [`Transport`] of a [`History`] (see
+/// [`history_for_save`]) without rebuilding the history: the `DOC` chunk is the transport
+/// doc as is, tiles are compressed from the raw blob. Same output as [`save_with_preview`].
+pub fn save_transport(doc: Vec<u8>, tiles: &[u8], preview: Option<(u32, u32, &[u8])>) -> Result<Vec<u8>, IoError> {
+    let raw = parse_transport_tiles(tiles)?;
+    #[cfg(not(target_arch = "wasm32"))]
+    let encoded: Vec<Vec<u8>> = {
+        use rayon::prelude::*;
+        raw.par_iter().map(|(f, c, d)| encode_tile_bytes(*f, *c, d)).collect()
+    };
+    #[cfg(target_arch = "wasm32")]
+    let encoded: Vec<Vec<u8>> = raw.iter().map(|(f, c, d)| encode_tile_bytes(*f, *c, d)).collect();
+    let mut out = Vec::with_capacity(4 + encoded.iter().map(Vec::len).sum::<usize>());
+    out.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+    for e in encoded {
+        out.extend_from_slice(&e);
+    }
+    assemble(doc, out, preview)
+}
+
+fn format_code(f: PixelFormat) -> u8 {
+    match f {
+        PixelFormat::F16 => 0,
+        PixelFormat::F32 => 1,
+    }
+}
+
+/// Append a tile's little-endian samples.
+fn append_tile_bytes(out: &mut Vec<u8>, t: &Tile) {
+    use prisme_core::tile::TileBuf;
+    match t.buf() {
+        TileBuf::F16(v) => {
+            for h in v {
+                out.extend_from_slice(&h.to_bits().to_le_bytes());
+            }
+        }
+        TileBuf::F32(v) => {
+            for f in v {
+                out.extend_from_slice(&f.to_le_bytes());
+            }
+        }
+    }
+}
+
+type RawTransportTile<'a> = (PixelFormat, u8, &'a [u8]);
+
+fn parse_transport_tiles(blob: &[u8]) -> Result<Vec<RawTransportTile<'_>>, IoError> {
+    let count = u32::from_le_bytes(blob.get(..4).ok_or_else(|| corrupt("truncated tiles"))?.try_into().expect("4")) as usize;
+    let meta_end = count.checked_mul(2).and_then(|n| n.checked_add(4)).ok_or_else(|| corrupt("tile count"))?;
+    let meta = blob.get(4..meta_end).ok_or_else(|| corrupt("truncated tile table"))?;
+    let mut o = meta_end;
+    let mut out = Vec::with_capacity(count);
+    for m in meta.chunks_exact(2) {
+        let format = match m[0] {
+            0 => PixelFormat::F16,
+            1 => PixelFormat::F32,
+            f => return Err(corrupt(format!("unknown tile format {f}"))),
+        };
+        let channels = m[1];
+        if channels != 1 && channels != 4 {
+            return Err(corrupt(format!("unsupported tile channel count {channels}")));
+        }
+        let len = TILE_PIXELS * channels as usize * format.bytes_per_channel();
+        let data = blob.get(o..o + len).ok_or_else(|| corrupt("truncated tile data"))?;
+        out.push((format, channels, data));
+        o += len;
+    }
+    Ok(out)
 }
 
 /// Check that every tile matches its grid's channel count (corrupt files could
@@ -373,6 +507,34 @@ mod tests {
         }
         // Shared tiles must stay shared after loading (dedup also in memory).
         assert_eq!(back.memory_bytes(), h.memory_bytes());
+    }
+
+    #[test]
+    fn transport_roundtrip_bit_exact_and_shared() {
+        let h = random_history(11);
+        let t = to_transport(&h).unwrap();
+        let back: History = from_transport(&t.doc, &t.tiles).unwrap();
+        assert_eq!(back.cursor(), h.cursor());
+        for (a, b) in h.entries().iter().zip(back.entries()) {
+            let (la, lb) = (raster_layers(&a.doc), raster_layers(&b.doc));
+            for (x, y) in la.iter().zip(&lb) {
+                assert!(x.iter().zip(y).all(|(p, q)| p.to_bits() == q.to_bits()));
+            }
+        }
+        assert_eq!(back.memory_bytes(), h.memory_bytes());
+        // Truncated blobs fail cleanly.
+        for len in (0..t.tiles.len()).step_by((t.tiles.len() / 50).max(1)) {
+            assert!(from_transport::<History>(&t.doc, &t.tiles[..len]).is_err());
+        }
+    }
+
+    #[test]
+    fn save_transport_matches_save() {
+        for include in [true, false] {
+            let h = random_history(5);
+            let t = to_transport(&history_for_save(&h, include)).unwrap();
+            assert_eq!(save_transport(t.doc, &t.tiles, None).unwrap(), save(&h, include).unwrap());
+        }
     }
 
     #[test]
