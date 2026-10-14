@@ -1,0 +1,105 @@
+[package]
+name = "prisme-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["xdg-portal"]
+## Linux: use xdg-desktop-portal (via `ashpd`/zbus) for the screen colour picker.
+## Works on Wayland and X11 desktops that run a portal. Without it, only the X11
+## pointer-grab picker is available on Linux.
+xdg-portal = ["dep:ashpd"]
+
+[dependencies]
+log = { workspace = true }
+web-time = { workspace = true }
+png = "0.18"
+rfd = "0.17"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+arboard = { version = "3.6", default-features = false, features = ["image-data"] }
+dirs = "6"
+pollster = "0.4"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+base64 = "0.22"
+web-sys = { version = "0.3", features = [
+    "Window",
+    "Navigator",
+    "Document",
+    "Element",
+    "HtmlElement",
+    "HtmlAnchorElement",
+    "Node",
+    "Blob",
+    "BlobPropertyBag",
+    "Url",
+    "Storage",
+    "StorageManager",
+    "FileSystemHandle",
+    "FileSystemDirectoryHandle",
+    "FileSystemFileHandle",
+    "FileSystemGetFileOptions",
+    "FileSystemGetDirectoryOptions",
+    "FileSystemRemoveOptions",
+    "FileSystemWritableFileStream",
+    "WritableStream",
+    "File",
+    "Clipboard",
+    "ClipboardItem",
+    "MediaQueryList",
+    "CssStyleDeclaration",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+block2 = "0.6"
+dispatch2 = "0.3"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSObject", "NSString", "NSGeometry"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "block2",
+    "objc2-core-foundation",
+    "NSColor",
+    "NSColorSampler",
+    "NSColorSpace",
+] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFData", "CFString", "CFCGTypes"] }
+objc2-core-graphics = { version = "0.3", default-features = false, features = [
+    "std",
+    "CGBase",
+    "CGBitmapContext",
+    "CGColorSpace",
+    "CGContext",
+    "CGDirectDisplay",
+    "CGDisplayConfiguration",
+    "CGError",
+    "CGEvent",
+    "CGEventSource",
+    "CGEventTypes",
+    "CGImage",
+    "CGRemoteOperation",
+    "CGWindow",
+] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_ColorSystem",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_System_LibraryLoader",
+] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb = "0.13"
+ashpd = { version = "0.13", default-features = false, features = ["async-io", "screenshot"], optional = true }
+
+[dev-dependencies]
+prisme-color = { workspace = true }

@@ -1,0 +1,47 @@
+[package]
+name = "prisme-io"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+## HEIC/HEIF decoding through the system libheif (native only).
+heic = ["dep:libheif-rs"]
+
+[dependencies]
+prisme-core = { workspace = true }
+prisme-color = { workspace = true }
+serde = { workspace = true }
+half = { workspace = true }
+log = { workspace = true }
+thiserror = { workspace = true }
+postcard = { workspace = true }
+lz4_flex = { workspace = true }
+png = "0.18"
+zune-jpeg = "0.5"
+zune-core = "0.5"
+jpeg-decoder = { version = "0.3", default-features = false }
+image = { version = "0.25", default-features = false, features = ["webp", "gif", "bmp", "ico", "tga", "qoi", "pnm", "hdr"] }
+tiff = "0.11"
+jxl-oxide = "0.12"
+exr = { version = "1.74", default-features = false }
+avif-parse = "2.1"
+rusty_av1d = { version = "1.2", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
+rawler = "0.8"
+usvg = { version = "0.47", default-features = false }
+libheif-rs = { version = "2", optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rayon = { workspace = true }
+exr = { version = "1.74", default-features = false, features = ["rayon"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# rawler pulls in uuid, which needs a randomness source on wasm32-unknown-unknown.
+uuid = { version = "1", features = ["js"] }
+# ahash (via prisme-core) pulls getrandom 0.3, which needs an explicit wasm backend.
+getrandom = { version = "0.3", features = ["wasm_js"] }
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tiff"] }
+rand = "0.9"

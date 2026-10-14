@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Prisme</title>
+  <link data-trunk rel="rust" data-wasm-opt="z" />
+  <style>
+    html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #18191c; color: #dee0e6; font-family: system-ui, sans-serif; }
+    #prisme-canvas { width: 100%; height: 100%; display: block; outline: none; }
+    #loading, #no-webgpu { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); text-align: center; }
+    #loading h1 { color: #6e8cff; font-weight: 600; letter-spacing: 0.04em; }
+  </style>
+</head>
+<body>
+  <canvas id="prisme-canvas"></canvas>
+  <div id="loading"><h1>◆ Prisme</h1><p id="no-webgpu">Loading…</p></div>
+</body>
+</html>

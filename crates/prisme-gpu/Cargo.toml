@@ -1,0 +1,24 @@
+[package]
+name = "prisme-gpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+prisme-core = { workspace = true }
+prisme-graph = { workspace = true }
+prisme-color = { workspace = true }
+wgpu = { version = "30", default-features = false, features = ["wgsl", "std"] }
+bytemuck = { workspace = true }
+half = { workspace = true }
+log = { workspace = true }
+ahash = { workspace = true }
+postcard = { workspace = true }
+serde = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rayon = { workspace = true }
+
+[dev-dependencies]
+pollster = "0.4"
+wgpu = { version = "30", features = ["metal", "vulkan", "dx12", "wgsl"] }

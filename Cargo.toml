@@ -1,0 +1,49 @@
+[workspace]
+resolver = "2"
+members = ["crates/*", "apps/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+prisme-core = { path = "crates/prisme-core" }
+prisme-color = { path = "crates/prisme-color" }
+prisme-graph = { path = "crates/prisme-graph" }
+prisme-gpu = { path = "crates/prisme-gpu" }
+prisme-io = { path = "crates/prisme-io" }
+prisme-export = { path = "crates/prisme-export" }
+prisme-brush = { path = "crates/prisme-brush" }
+prisme-tools = { path = "crates/prisme-tools" }
+prisme-text = { path = "crates/prisme-text" }
+prisme-vector = { path = "crates/prisme-vector" }
+prisme-platform = { path = "crates/prisme-platform" }
+prisme-ui = { path = "crates/prisme-ui" }
+
+serde = { version = "1", features = ["derive", "rc"] }
+glam = { version = "0.30", features = ["serde", "bytemuck"] }
+half = { version = "2", features = ["serde", "bytemuck"] }
+bytemuck = { version = "1", features = ["derive"] }
+log = "0.4"
+thiserror = "2"
+ahash = "0.8"
+postcard = { version = "1", features = ["alloc"] }
+lz4_flex = "0.11"
+rayon = "1"
+eframe = { version = "0.36", default-features = false, features = ["wgpu", "default_fonts", "persistence"] }
+egui = "0.36"
+egui-wgpu = "0.36"
+egui_dock = "0.21"
+egui-snarl = "0.12"
+moxcms = "0.9"
+web-time = "1"
+
+[profile.dev]
+opt-level = 1
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 4

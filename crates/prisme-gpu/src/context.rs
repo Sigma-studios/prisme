@@ -1,0 +1,48 @@
+/// Device + queue shared by the engine. Cloning is cheap (wgpu handles are refcounted).
+#[derive(Clone, Debug)]
+pub struct GpuContext {
+    pub device: wgpu::Device,
+    pub queue: wgpu::Queue,
+}
+
+impl GpuContext {
+    pub fn new(device: wgpu::Device, queue: wgpu::Queue) -> Self {
+        Self { device, queue }
+    }
+
+    /// Limits Prisme needs on top of WebGPU defaults (none beyond defaults today).
+    pub fn required_limits(adapter_limits: &wgpu::Limits) -> wgpu::Limits {
+        let mut l = wgpu::Limits::default();
+        // Use the largest textures the adapter offers (documents can be big).
+        l.max_texture_dimension_2d = adapter_limits.max_texture_dimension_2d.max(8192);
+        l.max_buffer_size = adapter_limits.max_buffer_size;
+        l.max_storage_buffer_binding_size = adapter_limits.max_storage_buffer_binding_size;
+        l
+    }
+
+    /// Create a headless context (tests, CLI tools).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn headless() -> Option<Self> {
+        let instance = wgpu::Instance::default();
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                ..Default::default()
+            })
+            .await
+            .ok()?;
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("prisme-headless"),
+                required_limits: Self::required_limits(&adapter.limits()),
+                ..Default::default()
+            })
+            .await
+            .ok()?;
+        Some(Self { device, queue })
+    }
+
+    pub fn max_texture_size(&self) -> u32 {
+        self.device.limits().max_texture_dimension_2d
+    }
+}
