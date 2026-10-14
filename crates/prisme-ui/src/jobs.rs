@@ -104,13 +104,22 @@ pub fn decode_file(s: &mut AppState, name: String, bytes: Vec<u8>, into: Option<
 }
 
 pub fn save(s: &mut AppState, save_as: bool) {
-    let Some(d) = s.doc() else { return };
+    if s.doc().is_some() {
+        save_doc(s, s.active, save_as);
+    }
+}
+
+/// Save document `i`. Returns false when nothing was started (bad index or encode error).
+pub fn save_doc(s: &mut AppState, i: usize, save_as: bool) -> bool {
+    let Some(d) = s.docs.get(i) else { return false };
+    let id = d.id;
     let preview = None;
     let bytes = match prisme_io::container::save_with_preview(&d.history, true, preview) {
         Ok(b) => b,
         Err(e) => {
             s.toast(format!("Save failed: {e}"));
-            return;
+            save_failed(s, id);
+            return false;
         }
     };
     let (doc_id, rev) = (d.id, d.history.revision());
@@ -123,19 +132,75 @@ pub fn save(s: &mut AppState, save_as: bool) {
                         let msg = format!("Saved {}", p.display());
                         let path = p.clone();
                         add_recent(s, &path);
-                        if let Some(d) = s.doc_mut() {
+                        if let Some(d) = s.docs.iter_mut().find(|d| d.id == doc_id) {
                             d.saved_revision = rev;
                         }
                         s.toast(msg);
+                        saved(s, doc_id);
                     }
-                    Err(e) => s.toast(format!("Save failed: {e}")),
+                    Err(e) => {
+                        s.toast(format!("Save failed: {e}"));
+                        save_failed(s, doc_id);
+                    }
                 }
-                return;
+                return true;
             }
     let _ = save_as;
     let name = format!("{}.prisme", d.doc().info.name.trim_end_matches(".prisme"));
     let pending = prisme_platform::save_file("Save project", &name, &[FileFilter::new("Prisme project", &["prisme"])], bytes);
     s.jobs.push(Job::Save { pending, doc: doc_id, revision: rev });
+    true
+}
+
+/// A document finished saving: close it if that was asked for ("Save" in the close prompt).
+fn saved(s: &mut AppState, doc: u64) {
+    if s.dialogs.close_after_save.contains(&doc) {
+        s.dialogs.close_after_save.retain(|&d| d != doc);
+        if let Some(i) = s.docs.iter().position(|d| d.id == doc) {
+            crate::commands::close_doc(s, i);
+        }
+    }
+}
+
+/// A save was cancelled or failed: drop any pending close of that document, and abort quitting.
+fn save_failed(s: &mut AppState, doc: u64) {
+    s.dialogs.close_after_save.retain(|&d| d != doc);
+    if std::mem::take(&mut s.dialogs.quit_after_save) {
+        s.toast("Quit cancelled: a document wasn't saved");
+    }
+}
+
+pub fn saving(s: &AppState) -> bool {
+    s.jobs.iter().any(|j| matches!(j, Job::Save { doc, .. } if *doc != u64::MAX))
+}
+
+/// Drives "Save all and quit": saves dirty documents one at a time (one save dialog open at
+/// once), then closes the window.
+pub fn quit_flow(s: &mut AppState, ctx: &egui::Context) {
+    prisme_platform::set_unsaved_changes(s.docs.iter().any(|d| d.is_dirty()));
+    if !s.dialogs.quit_after_save || saving(s) {
+        return;
+    }
+    match s.docs.iter().position(|d| d.is_dirty()) {
+        Some(i) => {
+            if !save_doc(s, i, false) {
+                s.dialogs.quit_after_save = false;
+            }
+        }
+        None => {
+            s.dialogs.quit_after_save = false;
+            s.dialogs.allow_quit = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+}
+
+/// Forget autosaves of documents the user chose to discard.
+pub fn discard_autosaves(s: &AppState) {
+    for d in s.docs.iter().filter(|d| d.is_dirty()) {
+        prisme_platform::storage_delete(&format!("autosave/{}", d.id));
+    }
+    prisme_platform::storage_delete(INDEX_KEY);
 }
 
 pub fn pick_screen(s: &mut AppState, to_bg: bool) {
@@ -307,9 +372,13 @@ pub fn poll(s: &mut AppState, ctx: &egui::Context) {
                         add_recent(s, std::path::Path::new(&n));
                     }
                     s.toast(format!("Saved {n}"));
+                    saved(s, doc);
                 }
-                Some(Ok(None)) => {}
-                Some(Err(e)) => s.toast(format!("Save failed: {e}")),
+                Some(Ok(None)) => save_failed(s, doc),
+                Some(Err(e)) => {
+                    s.toast(format!("Save failed: {e}"));
+                    save_failed(s, doc);
+                }
                 None => keep.push(Job::Save { pending, doc, revision }),
             },
             Job::ClipboardSet(mut p) => {

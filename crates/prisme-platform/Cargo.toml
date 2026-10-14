@@ -29,6 +29,8 @@ js-sys = "0.3"
 base64 = "0.22"
 web-sys = { version = "0.3", features = [
     "Window",
+    "Event",
+    "EventTarget",
     "Navigator",
     "Document",
     "Element",

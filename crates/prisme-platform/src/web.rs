@@ -96,3 +96,26 @@ pub(crate) fn mime_for_extension(ext: &str) -> &'static str {
         _ => "application/octet-stream",
     }
 }
+
+thread_local! {
+    static UNSAVED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static UNLOAD_HOOKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Installs a `beforeunload` listener once; it asks the browser to confirm leaving while dirty.
+pub(crate) fn set_unsaved_changes(dirty: bool) {
+    UNSAVED.with(|u| u.set(dirty));
+    if !dirty || UNLOAD_HOOKED.with(|h| h.replace(true)) {
+        return;
+    }
+    let Some(w) = window() else { return };
+    let cb = wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::Event)>::new(|e: web_sys::Event| {
+        if UNSAVED.with(|u| u.get()) {
+            e.prevent_default();
+            // Older browsers only prompt when returnValue is set.
+            set(e.as_ref(), "returnValue", &JsValue::from_str(""));
+        }
+    });
+    let _ = w.add_event_listener_with_callback("beforeunload", cb.as_ref().unchecked_ref());
+    cb.forget();
+}

@@ -350,6 +350,12 @@ impl eframe::App for PrismeApp {
             }
         }
 
+        // Window close with unsaved documents: hold it and ask.
+        if ctx.input(|i| i.viewport().close_requested()) && !s.dialogs.allow_quit && s.docs.iter().any(|d| d.is_dirty()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            s.dialogs.confirm_quit = true;
+        }
+        crate::jobs::quit_flow(s, &ctx);
         crate::commands::handle_shortcuts(s, &ctx);
         handle_dropped_files(s, &ctx);
 

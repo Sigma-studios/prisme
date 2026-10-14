@@ -297,6 +297,16 @@ pub fn now_seconds() -> f64 {
         .as_secs_f64()
 }
 
+/// Tell the platform whether any document has unsaved changes. Web: while set, closing or
+/// reloading the tab shows the browser's "Leave site?" prompt. Native: no-op (the app
+/// intercepts window close itself).
+pub fn set_unsaved_changes(dirty: bool) {
+    #[cfg(target_arch = "wasm32")]
+    web::set_unsaved_changes(dirty);
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = dirty;
+}
+
 /// Open a URL in the default browser (web: a new tab).
 pub fn open_url(url: &str) {
     #[cfg(target_os = "macos")]

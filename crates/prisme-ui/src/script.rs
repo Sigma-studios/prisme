@@ -188,7 +188,10 @@ pub fn step(s: &mut AppState, sc: &mut Script, ctx: &egui::Context) {
         "undo" => crate::commands::run_action(s, crate::actions::Action::Undo, ctx),
         "redo" => crate::commands::run_action(s, crate::actions::Action::Redo, ctx),
         "toggle-nodes" => crate::commands::run_action(s, crate::actions::Action::ToggleNodeOutput, ctx),
-        "quit" => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+        "quit" => {
+            s.dialogs.allow_quit = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
         other => log::warn!("script: unknown command {other}"),
     }
     sc.wait = 3;

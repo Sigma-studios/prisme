@@ -44,6 +44,14 @@ pub struct Dialogs {
     pub prefs_open: bool,
     pub about_open: bool,
     pub confirm_close: Option<usize>,
+    /// Documents to close once their save completes.
+    pub close_after_save: Vec<u64>,
+    /// "Unsaved changes" prompt shown on window close.
+    pub confirm_quit: bool,
+    /// Saving dirty documents one by one, then quitting.
+    pub quit_after_save: bool,
+    /// Let the next close request through.
+    pub allow_quit: bool,
     pub modify_sel: Option<(String, f32)>,
     pub recovery: Vec<(u64, String)>,
     pub shortcuts: crate::shortcuts::ShortcutsTab,
@@ -449,11 +457,42 @@ fn misc(s: &mut AppState, ctx: &egui::Context) {
         Window::new("Unsaved changes").collapsible(false).resizable(false).show(ctx, |ui| {
             ui.label(format!("“{name}” has unsaved changes."));
             ui.horizontal(|ui| {
-                if ui.button("Close without saving").clicked() {
+                if ui.button("Save").clicked() {
+                    s.dialogs.confirm_close = None;
+                    if let Some(id) = s.docs.get(i).map(|d| d.id) {
+                        s.dialogs.close_after_save.push(id);
+                        crate::jobs::save_doc(s, i, false);
+                    }
+                }
+                if ui.button("Don't save").clicked() {
                     crate::commands::close_doc(s, i);
                 }
                 if ui.button("Cancel").clicked() {
                     s.dialogs.confirm_close = None;
+                }
+            });
+        });
+    }
+    if s.dialogs.confirm_quit {
+        let names: Vec<String> = s.docs.iter().filter(|d| d.is_dirty()).map(|d| d.doc().info.name.clone()).collect();
+        Window::new("Quit Prisme?").collapsible(false).resizable(false).show(ctx, |ui| {
+            ui.label(if names.len() == 1 { "This document has unsaved changes:".to_string() } else { format!("{} documents have unsaved changes:", names.len()) });
+            for n in &names {
+                ui.label(RichText::new(format!("• {n}")).color(theme::TEXT_DIM));
+            }
+            ui.horizontal(|ui| {
+                if ui.button(if names.len() == 1 { "Save" } else { "Save all" }).clicked() {
+                    s.dialogs.confirm_quit = false;
+                    s.dialogs.quit_after_save = true;
+                }
+                if ui.button("Don't save").clicked() {
+                    crate::jobs::discard_autosaves(s);
+                    s.dialogs.confirm_quit = false;
+                    s.dialogs.allow_quit = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                if ui.button("Cancel").clicked() {
+                    s.dialogs.confirm_quit = false;
                 }
             });
         });
