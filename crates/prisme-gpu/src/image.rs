@@ -77,6 +77,8 @@ impl TexturePool {
             v.div_ceil(step) * step
         };
         let (tw, th) = (round(w), round(h));
+        prisme_core::perf::count("textures allocated", 1);
+        prisme_core::perf::count("texture MB allocated", (tw as u64 * th as u64 * format.block_copy_size(None).unwrap_or(8) as u64) >> 20);
         let tex = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("prisme-pool"),
             size: wgpu::Extent3d { width: tw, height: th, depth_or_array_layers: 1 },

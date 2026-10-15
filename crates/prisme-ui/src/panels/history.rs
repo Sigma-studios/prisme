@@ -14,7 +14,18 @@ pub fn ui(s: &mut AppState, ui: &mut Ui) {
         if ui.add_enabled(d.history.can_redo(), egui::Button::new(format!("{} Redo", egui_phosphor::regular::ARROW_CLOCKWISE))).clicked() {
             jump = Some(cursor + 1);
         }
-        ui.label(RichText::new(format!("{:.0} MB", d.history.memory_bytes() as f64 / 1e6)).small().color(theme::TEXT_DIM))
+        // Walks every tile of every state: once per history change, not every frame.
+        let key = egui::Id::new(("history-bytes", d.id));
+        let rev = d.history.revision();
+        let bytes = match ui.data(|m| m.get_temp::<(u64, usize)>(key)) {
+            Some((r, b)) if r == rev => b,
+            _ => {
+                let b = d.history.memory_bytes();
+                ui.data_mut(|m| m.insert_temp(key, (rev, b)));
+                b
+            }
+        };
+        ui.label(RichText::new(format!("{:.0} MB", bytes as f64 / 1e6)).small().color(theme::TEXT_DIM))
             .on_hover_text("Unique pixel memory held by history");
     });
     ui.separator();

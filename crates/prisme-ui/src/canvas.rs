@@ -153,6 +153,8 @@ pub fn canvas_tab(s: &mut AppState, ui: &mut Ui) {
     }
     ctx.data_mut(|d| d.insert_temp(drag_id, ds));
 
+    let input_span = prisme_core::perf::span("tool input");
+    prisme_core::perf::count("pointer events", tool_events.len() as u64);
     for (phase, pos, secondary) in tool_events {
         let view = s.docs[active].view;
         let p = view.screen_to_doc(center, pos);
@@ -194,12 +196,16 @@ pub fn canvas_tab(s: &mut AppState, ui: &mut Ui) {
             }
         ctx.request_repaint();
     }
+    drop(input_span);
     s.hover_doc = pointer.filter(|p| rect.contains(*p)).map(|p| s.docs[active].view.screen_to_doc(center, p));
 
     // ---------------------------------------------------------------- render
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, Color32::from_rgb(21, 22, 24));
-    render(s, &ctx, rect, ppp, &painter);
+    {
+        let _s = prisme_core::perf::span("render");
+        render(s, &ctx, rect, ppp, &painter);
+    }
 
     // ---------------------------------------------------------------- overlays
     overlays(s, &ctx, rect, &painter);
@@ -286,12 +292,14 @@ pub fn run_tool(s: &mut AppState, ev: ToolInput) {
         d.finish_stroke();
     }
     if d.working.is_none() {
+        let _s = prisme_core::perf::span("working copy");
         d.working = Some(d.history.current().clone());
     }
     // With a GPU, dab tools emit stroke ops instead of writing tiles (crate::stroke).
     let mut ops = vec![];
     let gpu = s.gpu.as_mut();
     let outcome = {
+        let _s = prisme_core::perf::span("tool");
         let mut cx = ToolCx { doc: d.working.as_mut().unwrap(), opts: &opts, fg, bg, strokes: gpu.is_some().then_some(&mut ops), view: d.view_rect };
         tool.input(&mut cx, &ev)
     };

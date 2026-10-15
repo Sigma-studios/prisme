@@ -19,6 +19,7 @@ use prisme_graph::{eval_curve, registry, SocketType, CURVE_CHANNELS, LEVEL_CHANN
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::sync::Arc;
+use prisme_core::perf;
 
 /// Spare textures the pool always keeps (bytes).
 const BASE_POOL_FREE: u64 = 256 << 20;
@@ -88,6 +89,8 @@ pub struct Engine {
     pool_keep: (u64, u64),
     /// f16 landing pipelines (created on first use).
     pub(crate) pack: Option<crate::pack::PackPipelines>,
+    /// GPU timestamps for the Performance panel (None without `TIMESTAMP_QUERY`).
+    pub timer: Option<crate::timer::GpuTimer>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -133,6 +136,7 @@ impl Engine {
         let kernels = Kernels::new(&ctx.device);
         let pool = TexturePool::new(ctx.device.clone());
         let uploads = UploadCache::new(ctx.device.clone(), ctx.queue.clone());
+        let timer = crate::timer::GpuTimer::new(&ctx.device, &ctx.queue);
         Engine {
             ctx,
             kernels,
@@ -146,6 +150,7 @@ impl Engine {
             last_stats: EvalStats::default(),
             pool_keep: (0, 0),
             pack: None,
+            timer,
         }
     }
 
@@ -178,6 +183,7 @@ impl Engine {
     /// zoom-out into them doesn't upload or build anything. Stops when `out_of_time`; true
     /// when there's nothing left to do.
     pub fn prefetch(&mut self, doc: &Document, regions: &[(u32, IRect)], out_of_time: &dyn Fn() -> bool) -> bool {
+        let _span = perf::span("prefetch");
         let mut enc = self.ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("prefetch") });
         let mut done = true;
         'all: for &(mip, rect) in regions {
@@ -212,6 +218,7 @@ impl Engine {
         if p.channels() != 4 {
             return;
         }
+        let _span = perf::span("adopt tiles");
         let mut enc = self.ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("adopt") });
         for (i, &id) in ids.iter().enumerate() {
             if let (true, Some(src)) = (id != 0, p.bits(i)) {
@@ -232,6 +239,27 @@ impl Engine {
         self.uploads.store.budget = bytes;
     }
 
+    /// Start a GPU-timed scope in `enc` (see [`crate::timer`]).
+    pub(crate) fn gpu_begin(&mut self, enc: &mut wgpu::CommandEncoder, label: &'static str) -> crate::timer::Scope {
+        match &mut self.timer {
+            Some(t) => t.begin(&self.ctx.device, &self.ctx.queue, enc, label),
+            None => crate::timer::Scope::NONE,
+        }
+    }
+
+    pub(crate) fn gpu_end(&mut self, enc: &mut wgpu::CommandEncoder, scope: crate::timer::Scope) {
+        if let Some(t) = &mut self.timer {
+            t.end(enc, scope);
+        }
+    }
+
+    /// Per UI frame: deliver GPU timings that came back.
+    pub fn poll_timer(&mut self) {
+        if let Some(t) = &mut self.timer {
+            t.poll(&self.ctx.device, &self.ctx.queue);
+        }
+    }
+
     pub fn evaluate(&mut self, req: &EvalRequest) -> Option<GpuImage> {
         self.evaluate_with(req, None)
     }
@@ -241,10 +269,12 @@ impl Engine {
         if req.rect.is_empty() {
             return None;
         }
+        let _span = perf::span("evaluate");
         self.uploads.begin_frame();
         self.frame += 1;
         let level_scale = 1.0 / (1u32 << req.mip) as f32;
-        let enc = self.ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("eval") });
+        let mut enc = self.ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("eval") });
+        let gpu = self.gpu_begin(&mut enc, "evaluate");
         let mut f = Frame {
             doc: req.doc,
             mip: req.mip,
@@ -287,7 +317,11 @@ impl Engine {
             }
             all.finish()
         }
-        hash_layers(&req.doc.layers, &mut f.layer_hashes, ov);
+        {
+            let _s = perf::span("hash layers");
+            hash_layers(&req.doc.layers, &mut f.layer_hashes, ov);
+        }
+        let record = perf::span("record");
 
         let result = match req.source {
             RenderSource::Graph => self.eval_node(&mut f, req.doc.graph.output, 0, req.rect, SocketType::Image),
@@ -320,8 +354,18 @@ impl Engine {
                 out
             }
         };
+        drop(record);
         self.last_stats = f.stats;
-        self.ctx.queue.submit([f.enc.finish()]);
+        perf::count("dispatches", f.stats.dispatches as u64);
+        perf::count("nodes run", f.stats.nodes_run as u64);
+        perf::count("node cache hits", f.stats.cache_hits as u64);
+        let mut enc = f.enc;
+        self.gpu_end(&mut enc, gpu);
+        {
+            let _s = perf::span("submit");
+            self.ctx.queue.submit([enc.finish()]);
+        }
+        let _s = perf::span("cache upkeep");
         self.uploads.end_frame();
         let fr = self.frame;
         // Recent results, newest first, up to twice this one's size: while zooming every
@@ -357,6 +401,7 @@ impl Engine {
     /// Evaluate a node over [`Document::extent`] at a small size and convert to sRGB8
     /// (navigator, node editor thumbnails).
     pub fn thumbnail(&mut self, doc: &Document, node: NodeId, max_side: u32) -> Option<GpuImage> {
+        let _span = perf::span("thumbnail");
         let ext = doc.extent();
         let side = ext.width().max(ext.height()).max(1) as u32;
         let mut mip = 0;
@@ -980,6 +1025,8 @@ impl Engine {
         if hits.is_empty() {
             return regular;
         }
+        let _span = perf::span("stroke view");
+        perf::count("stroke view tiles", hits.len() as u64);
         let p = [k as f32, s.channels() as f32, default];
         let mut out = self.new_image(f, rect);
         self.run(f, "k_stroke_view", &out, [regular.as_ref(), None, None, None], &p, None);

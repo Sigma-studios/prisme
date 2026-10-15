@@ -184,6 +184,7 @@ impl UploadCache {
             }
             // From the pool (reused across levels and frames, never cleared): fill it with the
             // grid's default, then only tiles with content are copied in.
+            prisme_core::perf::count("layer views (re)created", 1);
             let mut image = pool.image(rect, class.format());
             image.straight = true;
             let d = default_value;
@@ -209,6 +210,7 @@ impl UploadCache {
             };
             self.store.copy(enc, class, slot, &e.image.tex.tex, [(c.x * TS - rect.x0) as u32, (c.y * TS - rect.y0) as u32]);
             e.tiles.insert(c, id);
+            prisme_core::perf::count("view tile copies", 1);
         }
         Some(e.image.clone())
     }

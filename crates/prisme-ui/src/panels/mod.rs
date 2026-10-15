@@ -6,6 +6,7 @@ pub mod masks;
 pub mod navigator;
 pub mod nodes;
 pub mod options;
+pub mod perf;
 pub mod properties;
 pub mod scopes;
 

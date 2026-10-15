@@ -238,9 +238,13 @@ impl DocState {
         if !self.stroke_pending() {
             return;
         }
+        let _span = prisme_core::perf::span("finish stroke now");
         let s = self.stroke.take().unwrap();
         #[cfg(not(target_arch = "wasm32"))]
-        let px = s.readback.as_ref().and_then(|b| b.wait(&s.device));
+        let px = {
+            let _s = prisme_core::perf::span("wait for readback");
+            s.readback.as_ref().and_then(|b| b.wait(&s.device))
+        };
         #[cfg(target_arch = "wasm32")]
         let px = s.readback.as_ref().filter(|b| b.ready(&s.device)).and_then(|b| b.take(&s.device));
         self.land(s, px);
@@ -249,6 +253,7 @@ impl DocState {
     /// Non-blocking: land the finished stroke if its readback arrived. True while pending.
     fn poll_stroke(&mut self) -> bool {
         let Some(s) = self.stroke.as_ref().filter(|s| s.label.is_some()) else { return false };
+        let _span = prisme_core::perf::span("poll readback");
         let px = match &s.readback {
             Some(b) if !b.ready(&s.device) => return true,
             Some(b) => b.take(&s.device),
@@ -261,6 +266,7 @@ impl DocState {
 
     /// Write the stroke into the tiles as one history entry (and into an open working copy).
     fn land(&mut self, s: DocStroke, px: Option<Landed>) {
+        let _span = prisme_core::perf::span("land stroke");
         let (px, half) = match px {
             Some(Landed::F32(v)) => (Some(v), None),
             Some(Landed::F16(t)) => (None, Some(t)),
@@ -308,6 +314,8 @@ impl DocState {
                 (None, None) => false,
             };
             if !written {
+                let _s = prisme_core::perf::span("CPU replay");
+                prisme_core::perf::count("strokes replayed on the CPU", 1);
                 match &s.replay {
                     Replay::Dabs(spec, dabs) => replay_stroke(doc, spec, dabs),
                     Replay::Liquify(spec, Some(field)) => apply_cpu(doc, spec, field),
@@ -329,7 +337,10 @@ impl DocState {
                 self.adopt = Some((p, ids));
             }
         }
-        self.history.push(s.label.clone().unwrap_or_default(), doc);
+        {
+            let _s = prisme_core::perf::span("history push");
+            self.history.push(s.label.clone().unwrap_or_default(), doc);
+        }
         self.touch();
     }
 }

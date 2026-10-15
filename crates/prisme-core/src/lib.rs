@@ -15,6 +15,7 @@ pub mod history;
 pub mod ids;
 pub mod layer;
 pub mod mask;
+pub mod perf;
 pub mod tile;
 
 pub use document::{CanvasKind, DocUid, Document, DocumentInfo};

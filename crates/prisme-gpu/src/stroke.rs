@@ -191,6 +191,7 @@ impl Source {
         let img = texture(device, c.rect(), self.set.format);
         upload_tile(queue, &img, [0, 0], &self.grid, self.default, c);
         self.set.tiles.insert(c, img);
+        prisme_core::perf::count("stroke base tile uploads", 1);
     }
 }
 
@@ -238,9 +239,11 @@ impl Brush {
             log::warn!("stroke needs {} MiB of tiles; finishing it on the CPU", total >> 20);
             return false;
         }
+        let _span = prisme_core::perf::span("stroke tiles");
         for &c in layer.union(src) {
             self.base.load(device, queue, c);
         }
+        prisme_core::perf::count("stroke tiles created", new_layer.len() as u64);
         for c in new_layer {
             if let Some(s) = &mut self.sel {
                 s.load(device, queue, c);
@@ -359,6 +362,8 @@ impl Engine {
 
     /// Rasterize dabs into the stroke (one submission).
     pub fn stroke_dabs(&mut self, s: &mut GpuStroke, dabs: &[Dab]) {
+        let _span = prisme_core::perf::span("stroke dabs");
+        prisme_core::perf::count("dabs", dabs.len() as u64);
         for d in dabs {
             s.dirty = s.dirty.union(&dab_rect(d));
         }
@@ -392,8 +397,13 @@ impl Engine {
         let mut enc = self.ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("stroke") });
         if temps > BUDGET / 4 || side > max || !b.ensure(&self.ctx.device, &self.ctx.queue, &mut enc, &layer, &src) {
             s.overflow = true;
+            prisme_core::perf::count("stroke overflowed (lands on CPU)", 1);
             return;
         }
+        let scope = match &mut self.timer {
+            Some(t) => t.begin(&self.ctx.device, &self.ctx.queue, &mut enc, "stroke dabs"),
+            None => crate::timer::Scope::NONE,
+        };
         match b.mode {
             StrokeMode::Paint { target, opacity, lock_alpha } => {
                 for chunk in dabs.chunks(BATCH) {
@@ -405,6 +415,9 @@ impl Engine {
                     self.retouch_dab(&mut enc, b, m, d);
                 }
             }
+        }
+        if let Some(t) = &mut self.timer {
+            t.end(&mut enc, scope);
         }
         self.ctx.queue.submit([enc.finish()]);
         s.generation += 1;
@@ -496,9 +509,17 @@ impl Engine {
     /// Convert f32 tile textures (`channels` 1 or 4) to f16 tiles on the GPU and start reading
     /// them back (see [`crate::pack`]).
     pub fn pack_tiles(&mut self, tiles: &[(TileCoord, GpuImage)], channels: u8) -> crate::pack::PackedTiles {
+        let _span = prisme_core::perf::span("pack tiles");
         let device = self.ctx.device.clone();
+        let mut enc = device.create_command_encoder(&Default::default());
+        let scope = self.gpu_begin(&mut enc, "pack tiles");
+        self.ctx.queue.submit([enc.finish()]);
         let p = self.pack.get_or_insert_with(|| crate::pack::PackPipelines::new(&device));
-        crate::pack::PackedTiles::start(&self.ctx.device, &self.ctx.queue, p, tiles, channels)
+        let packed = crate::pack::PackedTiles::start(&self.ctx.device, &self.ctx.queue, p, tiles, channels);
+        let mut enc = device.create_command_encoder(&Default::default());
+        self.gpu_end(&mut enc, scope);
+        self.ctx.queue.submit([enc.finish()]);
+        packed
     }
 
     pub fn stroke_readback(&self, s: &GpuStroke) -> Option<Vec<Readback>> {

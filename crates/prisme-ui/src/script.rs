@@ -2,7 +2,7 @@
 //!
 //! `PRISME_SCRIPT="cmd;cmd;..."`, one command per frame:
 //! `new:W,H` · `new-infinite:W,H[,0]` (infinite canvas, W×H initial frame, white background; 0: transparent) · `open:PATH` · `tool:<ToolKind debug name>` · `drag:x0,y0,x1,y1` (document px) ·
-//! `stroke:x0,y0,x1,y1,…` (polyline drag) · `brush:<preset name>` · `size:N` (brush px) ·
+//! `stroke:x0,y0,x1,y1,…` (polyline drag, in one frame) · `paint:FRAMES,x0,y0,x1,y1,…` (polyline drag over FRAMES frames) · `brush:<preset name>` · `size:N` (brush px) ·
 //! `click:x,y` · `altclick:x,y` (clone source) · `key:Enter|Escape` · `type:text` · `node:<kind>` · `param:key=value` (selected node) ·
 //! `fg:#rrggbb` · `wait:N` (frames) · `shot:PATH` (window screenshot PNG) · `export:PATH` (PNG at full res) ·
 //! `export-sel:PATH` (Export Selection) · `action:<Action debug name>` (e.g. `action:CopyMerged`) ·
@@ -11,7 +11,7 @@
 //! `hdr-status` (log surface format / colour space / headroom) · `liquify-mode:forward|bloat|pucker|twirl-cw|…`
 //! (`LiquifyMode::id`) · `hold:x,y,SECONDS` (press and hold still, ticking the tool at 30 Hz: stationary
 //! liquify modes, airbrush) · `sleep:SECONDS` (block the UI thread: wall-clock pauses, e.g. to sample
-//! memory while background work finishes) · `quit`.
+//! memory while background work finishes) · `panel:<title>` (show a panel, e.g. `panel:Performance`) · `perf-limit:MS` (slow-frame limit) · `perf-report` (log the Performance panel's report) · `quit`.
 
 use crate::app::AppState;
 use prisme_tools::{Phase, ToolInput, ToolKey, ToolKind};
@@ -22,6 +22,8 @@ pub struct Script {
     pub wait: u32,
     pub pending_shot: Option<String>,
     pub export_path: Option<String>,
+    /// `paint`: polyline, frames done, frames in all.
+    pub painting: Option<(Vec<[f32; 2]>, usize, usize)>,
 }
 
 impl Script {
@@ -91,6 +93,21 @@ pub fn step(s: &mut AppState, sc: &mut Script, ctx: &egui::Context) {
             ctx.request_repaint();
             return;
         }
+    }
+    // A stroke drawn over several frames: one pointer move per frame.
+    if let Some((pts, k, n)) = &mut sc.painting {
+        *k += 1;
+        let f = *k as f32 / *n as f32 * (pts.len() - 1) as f32;
+        let (i, u) = ((f.floor() as usize).min(pts.len() - 2), f - f.floor().min((pts.len() - 2) as f32));
+        let p = [pts[i][0] + (pts[i + 1][0] - pts[i][0]) * u, pts[i][1] + (pts[i + 1][1] - pts[i][1]) * u];
+        let t = prisme_platform::now_seconds();
+        let done = *k >= *n;
+        crate::canvas::run_tool(s, ev(if done { Phase::Up } else { Phase::Move }, p, t));
+        if done {
+            sc.painting = None;
+        }
+        ctx.request_repaint();
+        return;
     }
     // Strokes land asynchronously (GPU readback): let them finish before the next command.
     if sc.pending_shot.is_some() || !s.jobs.is_empty() || s.docs.iter().any(|d| d.stroke_pending()) {
@@ -165,6 +182,14 @@ pub fn step(s: &mut AppState, sc: &mut Script, ctx: &egui::Context) {
                     }
                 }
                 crate::canvas::run_tool(s, ev(Phase::Up, *pts.last().unwrap(), t + i as f64 * 0.01 + 0.01));
+            }
+        }
+        "paint" => {
+            let n = nums(arg);
+            let pts: Vec<[f32; 2]> = n[1..].chunks_exact(2).map(|p| [p[0], p[1]]).collect();
+            if pts.len() >= 2 {
+                crate::canvas::run_tool(s, ev(Phase::Down, pts[0], t));
+                sc.painting = Some((pts, 0, (n[0] as usize).max(1)));
             }
         }
         "brush" => {
@@ -290,6 +315,9 @@ pub fn step(s: &mut AppState, sc: &mut Script, ctx: &egui::Context) {
                 _ => crate::hdr::HdrMode::Auto,
             };
         }
+        "panel" => s.open_tab = crate::app::Tab::ALL.into_iter().find(|t| t.title().eq_ignore_ascii_case(arg)),
+        "perf-limit" => s.settings.perf_slow_ms = arg.parse().unwrap_or(s.settings.perf_slow_ms),
+        "perf-report" => log::info!("script: {}", crate::perf::report(s)),
         "hdr-status" => log::info!("script: hdr-status {:?} (mode {:?}, highlights {:?})", s.hdr, s.settings.hdr_mode, s.settings.hdr_highlights),
         "shortcuts" => crate::shortcuts::open(s),
         "new-dialog" => {

@@ -929,6 +929,8 @@ pub fn menu_bar(s: &mut AppState, ui: &mut Ui, dock: &mut DockState<Tab>) {
                 if ui.selectable_label(open, t.title()).clicked() {
                     if let Some(loc) = dock.find_tab(&t) {
                         dock.remove_tab(loc);
+                    } else if t == Tab::Performance {
+                        crate::app::show_below_canvas(dock, t, 0.6);
                     } else {
                         dock.push_to_focused_leaf(t);
                     }

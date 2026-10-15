@@ -28,11 +28,12 @@ pub enum Tab {
     Brushes,
     Navigator,
     Shortcuts,
+    Performance,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 10] =
-        [Tab::Canvas, Tab::Layers, Tab::Nodes, Tab::Properties, Tab::Color, Tab::History, Tab::Masks, Tab::Scopes, Tab::Brushes, Tab::Navigator];
+    pub const ALL: [Tab; 11] =
+        [Tab::Canvas, Tab::Layers, Tab::Nodes, Tab::Properties, Tab::Color, Tab::History, Tab::Masks, Tab::Scopes, Tab::Brushes, Tab::Navigator, Tab::Performance];
 
     pub fn title(self) -> &'static str {
         match self {
@@ -47,6 +48,7 @@ impl Tab {
             Tab::Brushes => "Brushes",
             Tab::Navigator => "Navigator",
             Tab::Shortcuts => "Keyboard Shortcuts",
+            Tab::Performance => "Performance",
         }
     }
 }
@@ -88,6 +90,10 @@ pub struct AppState {
     pub space_pan: bool,
     /// Frames spent waiting to create the launch document (None once settled).
     pub startup_frames: Option<u32>,
+    /// Frame timings (Performance panel, slow-frame warnings).
+    pub perf: crate::perf::PerfState,
+    /// Show this panel (opened in the focused leaf if it isn't docked).
+    pub open_tab: Option<Tab>,
 }
 
 pub struct PrismeApp {
@@ -101,15 +107,21 @@ const DOCK_KEY: &str = "prisme-dock-v2";
 
 /// Open the node editor docked under the canvas (or focus it if already open).
 pub fn show_node_editor(dock: &mut DockState<Tab>) {
-    if let Some(loc) = dock.find_tab(&Tab::Nodes) {
+    show_below_canvas(dock, Tab::Nodes, 0.62);
+}
+
+/// Show `tab`, docking it under the canvas (taking `1 - fraction` of its height) if it isn't
+/// open: panels that are used while watching the canvas.
+pub fn show_below_canvas(dock: &mut DockState<Tab>, tab: Tab, fraction: f32) {
+    if let Some(loc) = dock.find_tab(&tab) {
         let _ = dock.set_active_tab(loc);
         return;
     }
     match dock.find_tab(&Tab::Canvas) {
         Some(path) if path.surface == egui_dock::SurfaceIndex::main() => {
-            dock.main_surface_mut().split_below(path.node, 0.62, vec![Tab::Nodes]);
+            dock.main_surface_mut().split_below(path.node, fraction, vec![tab]);
         }
-        _ => dock.push_to_focused_leaf(Tab::Nodes),
+        _ => dock.push_to_focused_leaf(tab),
     }
 }
 
@@ -196,6 +208,8 @@ impl PrismeApp {
             frame_ms: 0.0,
             space_pan: false,
             startup_frames: Some(0),
+            perf: Default::default(),
+            open_tab: None,
         };
         s.install_text_bounds();
         crate::jobs::check_recovery(&mut s);
@@ -337,6 +351,7 @@ impl TabViewer for Viewer<'_> {
     }
 
     fn ui(&mut self, ui: &mut Ui, tab: &mut Tab) {
+        let _span = prisme_core::perf::span(tab.title());
         match tab {
             Tab::Canvas => crate::canvas::canvas_tab(self.s, ui),
             Tab::Layers => crate::panels::layers::ui(self.s, ui),
@@ -349,6 +364,7 @@ impl TabViewer for Viewer<'_> {
             Tab::Brushes => crate::panels::brushes::ui(self.s, ui),
             Tab::Navigator => crate::panels::navigator::ui(self.s, ui),
             Tab::Shortcuts => crate::shortcuts::ui(self.s, ui),
+            Tab::Performance => crate::panels::perf::ui(self.s, ui),
         }
     }
 
@@ -365,17 +381,25 @@ impl TabViewer for Viewer<'_> {
 }
 
 impl eframe::App for PrismeApp {
-    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
         let t0 = prisme_platform::now_seconds();
         if self.s.frame_ms == 0.0 {
             log::info!("Prisme: first frame");
         }
         let ctx = ui.ctx().clone();
         let s = &mut self.s;
-        crate::jobs::poll(s, &ctx);
-        crate::stroke::poll(s, &ctx);
+        crate::perf::begin(s, frame.info().cpu_usage);
+        {
+            let _s = prisme_core::perf::span("jobs");
+            crate::jobs::poll(s, &ctx);
+        }
+        {
+            let _s = prisme_core::perf::span("land strokes");
+            crate::stroke::poll(s, &ctx);
+        }
         startup_doc(s, &ctx);
         if let Some(sc) = &mut self.script {
+            let _s = prisme_core::perf::span("script");
             crate::script::step(s, sc, &ctx);
         }
 
@@ -414,15 +438,20 @@ impl eframe::App for PrismeApp {
             }
         }
         crate::jobs::quit_flow(s, &ctx);
-        crate::commands::handle_shortcuts(s, &ctx);
+        {
+            let _s = prisme_core::perf::span("shortcuts");
+            crate::commands::handle_shortcuts(s, &ctx);
+        }
         handle_dropped_files(s, &ctx);
 
+        let chrome = prisme_core::perf::span("menus & bars");
         egui::Panel::top("menu").show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| crate::commands::menu_bar(s, ui, &mut self.dock));
         });
         egui::Panel::top("options").show(ui, |ui| crate::panels::options::ui(s, ui));
         egui::Panel::bottom("status").exact_size(22.0).show(ui, |ui| status_bar(s, ui));
         egui::Panel::left("toolbar").exact_size(44.0).resizable(false).show(ui, |ui| toolbar(s, ui));
+        drop(chrome);
 
         match s.dialogs.shortcuts.request.take() {
             // Show the shortcuts tab, adding it next to Canvas if it isn't open.
@@ -441,6 +470,16 @@ impl eframe::App for PrismeApp {
                     self.dock.remove_tab(p);
                 }
             }
+            None => {}
+        }
+        match s.open_tab.take() {
+            Some(Tab::Performance) => show_below_canvas(&mut self.dock, Tab::Performance, 0.6),
+            Some(t) => match self.dock.find_tab(&t) {
+                Some(p) => {
+                    let _ = self.dock.set_active_tab(p);
+                }
+                None => self.dock.push_to_focused_leaf(t),
+            },
             None => {}
         }
         if std::mem::take(&mut s.dialogs.shortcuts.reveal)
@@ -467,12 +506,19 @@ impl eframe::App for PrismeApp {
                 .show_inside(ui, &mut Viewer { s });
         });
 
-        crate::dialogs::show(s, &ctx);
-        crate::jobs::autosave(s);
+        {
+            let _s = prisme_core::perf::span("dialogs");
+            crate::dialogs::show(s, &ctx);
+        }
+        {
+            let _s = prisme_core::perf::span("autosave");
+            crate::jobs::autosave(s);
+        }
         if !s.jobs.is_empty() || s.gpu.as_ref().is_some_and(|g| g.pick.is_some() || g.scopes.busy()) {
             ctx.request_repaint();
         }
         s.frame_ms = ((prisme_platform::now_seconds() - t0) * 1000.0) as f32;
+        crate::perf::end(s, &ctx, s.frame_ms);
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {

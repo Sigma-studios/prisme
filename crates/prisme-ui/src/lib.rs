@@ -11,6 +11,7 @@ pub mod hdr;
 pub mod jobs;
 pub mod offload;
 pub mod outline;
+pub mod perf;
 pub mod panels;
 pub mod rasterizer;
 pub mod script;
@@ -31,6 +32,8 @@ pub fn wgpu_options() -> egui_wgpu::WgpuConfiguration {
     create.device_descriptor = std::sync::Arc::new(|adapter: &egui_wgpu::wgpu::Adapter| egui_wgpu::wgpu::DeviceDescriptor {
         label: Some("prisme"),
         required_limits: prisme_gpu::GpuContext::required_limits(&adapter.limits()),
+        // GPU timings in the Performance panel, where supported.
+        required_features: adapter.features() & egui_wgpu::wgpu::Features::TIMESTAMP_QUERY,
         ..Default::default()
     });
     egui_wgpu::WgpuConfiguration {

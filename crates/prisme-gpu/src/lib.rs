@@ -13,6 +13,7 @@ pub mod tiles;
 pub mod readback;
 pub mod scopes;
 pub mod stroke;
+pub mod timer;
 pub mod upload;
 
 pub use context::GpuContext;

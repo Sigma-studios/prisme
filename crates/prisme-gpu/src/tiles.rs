@@ -247,6 +247,8 @@ impl TileStore {
     }
 
     fn add_page(&mut self, class: Class, layers: u32) {
+        let _span = prisme_core::perf::span("new tile page");
+        prisme_core::perf::count("tile pages allocated", 1);
         let format = class.format();
         let tex = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("tile-page"),
@@ -282,6 +284,7 @@ impl TileStore {
         }
         old.sort_unstable_by_key(|(t, _)| *t);
         let n = old.len().div_ceil(4);
+        prisme_core::perf::count("tiles evicted", n as u64);
         for (_, k) in old.into_iter().take(n) {
             let r = self.resident.remove(&k).unwrap();
             self.pages.get_mut(&k.0).unwrap()[r.slot.page as usize].free.push(r.slot.layer);
@@ -341,6 +344,7 @@ impl TileStore {
     /// Drop tiles unused for `max_age` frames, then compact if less than half the page space
     /// is live. Only between evaluations (see [`TileStore::compact`]).
     pub fn trim(&mut self, max_age: u64) {
+        let _span = prisme_core::perf::span("trim tiles");
         let frame = self.frame;
         let mut freed = vec![];
         self.resident.retain(|k, r| {
@@ -363,6 +367,7 @@ impl TileStore {
     /// them, by GPU copy, dropping the old pages. Only between evaluations: no recorded
     /// command may still name a slot.
     pub fn compact(&mut self) {
+        let _span = prisme_core::perf::span("compact tiles");
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("tile-compact") });
         for class in [Class::Mask, Class::Rgba16, Class::Rgba32] {
             let Some(old) = self.pages.remove(&class) else { continue };
@@ -426,6 +431,7 @@ impl TileStore {
             let slot = self.alloc(class);
             self.write(class, slot, &class.bytes(t));
             self.uploads += 1;
+            prisme_core::perf::count("tile uploads", 1);
             self.keep(key, slot, doc);
             return Some(slot);
         }
@@ -435,6 +441,7 @@ impl TileStore {
         let channels = if class == Class::Mask { 1.0 } else { 4.0 };
         kernels.dispatch(enc, "k_downsample", self.image(class, slot), None, [inputs[0].as_ref(), inputs[1].as_ref(), inputs[2].as_ref(), inputs[3].as_ref()], &[channels, default], None, &G);
         self.builds += 1;
+        prisme_core::perf::count("tile builds", 1);
         self.keep(key, slot, doc);
         Some(slot)
     }

@@ -12,6 +12,7 @@ bytemuck = { workspace = true }
 log = { workspace = true }
 ahash = { workspace = true }
 prisme-color = { workspace = true }
+web-time = { workspace = true }
 
 [dev-dependencies]
 rand = "0.9"

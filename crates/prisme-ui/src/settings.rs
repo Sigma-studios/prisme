@@ -31,6 +31,9 @@ pub struct Settings {
     pub hdr_peak_fallback: f32,
     /// Linear range (× SDR white) of the extended scopes; 0 = automatic.
     pub scope_range: f32,
+    /// Status-bar message when a frame is slower than `perf_slow_ms`.
+    pub perf_warn: bool,
+    pub perf_slow_ms: f32,
 }
 
 impl Default for Settings {
@@ -53,6 +56,8 @@ impl Default for Settings {
             hdr_highlights: prisme_gpu::HighlightMode::SoftRolloff,
             hdr_peak_fallback: 4.0,
             scope_range: 0.0,
+            perf_warn: true,
+            perf_slow_ms: 50.0,
         }
     }
 }
