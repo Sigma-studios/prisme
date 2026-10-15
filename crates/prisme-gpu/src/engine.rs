@@ -13,7 +13,7 @@ use crate::stroke::GpuStroke;
 use crate::upload::{UploadCache, UploadKey};
 use prisme_core::graph::{Node, ParamValue};
 use prisme_core::layer::{FillContent, Layer, LayerKind};
-use prisme_core::tile::TILE_SIZE;
+use prisme_core::tile::{TileCoord, TILE_SIZE};
 use prisme_core::{DocUid, Document, Gradient, IRect, LayerId, NodeId, TileGrid};
 use prisme_graph::{eval_curve, registry, SocketType, CURVE_CHANNELS, LEVEL_CHANNELS};
 use std::collections::{HashMap, HashSet};
@@ -71,6 +71,14 @@ struct CachedResult {
     last_used: u64,
 }
 
+/// The last composed stroke view (see `Engine::stroke_view`): valid for one stroke, upload,
+/// level and rect, holding the stroke as of `generation`.
+struct StrokeViewCache {
+    key: (u64, UploadKey, u32, IRect, bool),
+    image: GpuImage,
+    generation: u64,
+}
+
 pub struct Engine {
     pub ctx: GpuContext,
     pub kernels: Kernels,
@@ -91,6 +99,7 @@ pub struct Engine {
     pub(crate) pack: Option<crate::pack::PackPipelines>,
     /// GPU timestamps for the Performance panel (None without `TIMESTAMP_QUERY`).
     pub timer: Option<crate::timer::GpuTimer>,
+    stroke_view: Option<StrokeViewCache>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -151,6 +160,7 @@ impl Engine {
             pool_keep: (0, 0),
             pack: None,
             timer,
+            stroke_view: None,
         }
     }
 
@@ -270,6 +280,9 @@ impl Engine {
             return None;
         }
         let _span = perf::span("evaluate");
+        if stroke.is_none() {
+            self.stroke_view = None;
+        }
         self.uploads.begin_frame();
         self.frame += 1;
         let level_scale = 1.0 / (1u32 << req.mip) as f32;
@@ -1009,33 +1022,50 @@ impl Engine {
     /// The upload with the live stroke tiles spliced in (block-averaged at mip > 0). Each
     /// tile's footprint at this level is rendered on its own and copied in. Past mip 8 a level
     /// pixel spans several tiles: the regular upload shows until the stroke lands.
+    ///
+    /// The result is kept for the next frame: while the view stays put, only the tiles the
+    /// stroke changed since are rendered again, so a frame costs the same however many tiles
+    /// the stroke has covered. (The layer under the stroke doesn't change while it's live.)
     fn stroke_view(&mut self, f: &mut Frame, s: &GpuStroke, regular: Option<GpuImage>, rect: IRect, default: f32) -> Option<GpuImage> {
         let k = 1i32 << f.mip;
         if k > TILE_SIZE as i32 {
             return regular;
         }
-        let hits: Vec<(IRect, GpuImage)> = s
+        let hits: Vec<(TileCoord, IRect, GpuImage)> = s
             .live_tiles()
             .filter_map(|(c, t)| {
                 let r = c.rect();
                 let level = IRect::new(r.x0 / k, r.y0 / k, r.x1 / k, r.y1 / k).intersect(&rect);
-                (!level.is_empty()).then(|| (level, t.clone()))
+                (!level.is_empty()).then(|| (c, level, t.clone()))
             })
             .collect();
         if hits.is_empty() {
             return regular;
         }
         let _span = perf::span("stroke view");
-        perf::count("stroke view tiles", hits.len() as u64);
         let p = [k as f32, s.channels() as f32, default];
-        let mut out = self.new_image(f, rect);
-        self.run(f, "k_stroke_view", &out, [regular.as_ref(), None, None, None], &p, None);
-        for (level, tile) in hits {
+        let key = (s.id, s.key, f.mip, rect, regular.is_some());
+        let (mut out, since) = match self.stroke_view.take().filter(|c| c.key == key) {
+            Some(c) => (c.image, c.generation),
+            None => {
+                let out = self.new_image(f, rect);
+                self.run(f, "k_stroke_view", &out, [regular.as_ref(), None, None, None], &p, None);
+                (out, 0)
+            }
+        };
+        let mut n = 0;
+        for (c, level, tile) in hits {
+            if s.tile_gen.get(&c).is_some_and(|g| *g <= since) {
+                continue;
+            }
+            n += 1;
             let part = self.new_image(f, level);
             self.run(f, "k_stroke_view", &part, [regular.as_ref(), Some(&tile), None, None], &p, None);
             crate::stroke::copy(&mut f.enc, &part, &out, level);
         }
+        perf::count("stroke view tiles", n);
         out.straight = true;
+        self.stroke_view = Some(StrokeViewCache { key, image: out.clone(), generation: s.generation });
         Some(out)
     }
 

@@ -278,9 +278,20 @@ pub struct GpuStroke {
     /// The stroke outgrew the VRAM budget or the texture size limit: the preview stops
     /// growing and the host must land the stroke with the CPU engine instead of a readback.
     pub overflow: bool,
+    /// Unique per stroke (the engine's composed stroke view is cached under it).
+    pub(crate) id: u64,
+    /// Generation that last changed each live tile, so a view composed at generation `g`
+    /// only re-renders the tiles changed after it.
+    pub(crate) tile_gen: HashMap<TileCoord, u64>,
 }
 
 impl GpuStroke {
+    fn new(key: UploadKey, kind: Kind, channels: u8, overflow: bool) -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        GpuStroke { key, kind, channels, dirty: IRect::EMPTY, generation: 0, overflow, id, tile_gen: HashMap::new() }
+    }
+
     pub fn channels(&self) -> u8 {
         self.channels
     }
@@ -294,6 +305,11 @@ impl GpuStroke {
     }
 
     /// The `live` tiles of a dab stroke.
+    /// Stroke tiles created so far.
+    pub fn live_tile_count(&self) -> usize {
+        self.live_tiles().count()
+    }
+
     pub(crate) fn live_tiles(&self) -> impl Iterator<Item = (TileCoord, &GpuImage)> {
         let tiles = match &self.kind {
             Kind::Brush(b) => Some(b.live.tiles.iter().map(|(c, t)| (*c, t))),
@@ -357,7 +373,7 @@ impl Engine {
             cov: paint.then(|| TileSet::new(wgpu::TextureFormat::R32Float)),
             carried: None,
         };
-        GpuStroke { key, kind: Kind::Brush(brush), channels, dirty: IRect::EMPTY, generation: 0, overflow: false }
+        GpuStroke::new(key, Kind::Brush(brush), channels, false)
     }
 
     /// Rasterize dabs into the stroke (one submission).
@@ -421,6 +437,9 @@ impl Engine {
         }
         self.ctx.queue.submit([enc.finish()]);
         s.generation += 1;
+        for c in layer {
+            s.tile_gen.insert(c, s.generation);
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -599,7 +618,7 @@ impl Engine {
             (Some(snapshot(&device, &queue, &base, want, 0.0)), selection.map(|s| snapshot(&device, &queue, &s, want, 0.0)))
         };
         let liquify = Liquify { field, rect, step, show_mask: false, base, sel };
-        GpuStroke { key, kind: Kind::Liquify(liquify), channels, dirty: IRect::EMPTY, generation: 0, overflow }
+        GpuStroke::new(key, Kind::Liquify(liquify), channels, overflow)
     }
 
     /// Upload changed field nodes (`nodes` rect, row-major values).
@@ -704,7 +723,7 @@ impl Engine {
             (Some(snapshot(&device, &queue, &source, want, 0.0)), mask.map(|(m, d)| (snapshot(&device, &queue, &m, want, d), d)))
         };
         let xform = Xform { base, mask, inv: Homography::IDENTITY.m, rect, bounds: rect };
-        GpuStroke { key, kind: Kind::Xform(xform), channels: source.channels, dirty: IRect::EMPTY, generation: 0, overflow }
+        GpuStroke::new(key, Kind::Xform(xform), source.channels, overflow)
     }
 
     /// Move the preview: `h` maps source px to document px.

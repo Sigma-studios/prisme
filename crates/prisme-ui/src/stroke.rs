@@ -356,7 +356,7 @@ mod tests {
         d.working.get_or_insert_with(|| d.history.current().clone());
         let mut ops = vec![];
         let out = {
-            let mut cx = ToolCx { doc: d.working.as_mut().unwrap(), opts: o, fg: [0.0; 4], bg: [1.0; 4], strokes: Some(&mut ops), view: d.view_rect };
+            let mut cx = ToolCx { doc: d.working.as_mut().unwrap(), opts: o, fg: [0.8, 0.1, 0.1, 1.0], bg: [1.0; 4], strokes: Some(&mut ops), view: d.view_rect };
             match &ev {
                 Ok(ev) => t.input(&mut cx, ev),
                 Err(k) => t.key(&mut cx, k),
@@ -428,6 +428,49 @@ mod tests {
         assert_eq!(input(&mut d, &mut e, t.as_mut(), &o, Err(ToolKey::Escape)), ToolOutcome::Cancel);
         assert!(d.stroke.is_none() && d.history.cursor() == 0);
         assert_eq!(layer(d.doc()), before);
+    }
+
+    #[test]
+    fn live_stroke_view_redraws_only_changed_tiles_and_matches_a_full_redraw() {
+        use prisme_gpu::{EvalFormat, EvalRequest, Readback, RenderSource};
+        let Some(ctx) = pollster::block_on(prisme_gpu::GpuContext::headless()) else { return eprintln!("no GPU adapter; skipping") };
+        let mut e = Engine::new(ctx.clone());
+        let mut doc = Document::with_background("t", 4000, 600, Some([1.0; 4]));
+        let id = doc.active_layer.unwrap();
+        doc.layer_mut(id).unwrap().raster_mut().unwrap().map_rect(&IRect::new(100, 100, 3900, 500), |x, y, p| p.copy_from_slice(&[x as f32 / 4000.0, y as f32 / 600.0, 0.4, 1.0]));
+        let mut d = DocState::new(doc);
+        let mut o = ToolOptions::default();
+        o.brush.size = 60.0;
+        let mut t = make_tool(ToolKind::Brush);
+        let mut at = |d: &mut DocState, e: &mut Engine, ph: Phase, x: f32| {
+            let mut ev = ToolInput::mouse(ph, [x, 300.0 + (x / 40.0).sin() * 150.0]);
+            ev.time = x as f64 * 0.001;
+            input(d, e, t.as_mut(), &o, Ok(ev));
+        };
+        let rect = IRect::new(0, 0, 4000, 600);
+        let render = |e: &mut Engine, d: &DocState, mip: u32| {
+            let k = 1 << mip;
+            let r = IRect::new(0, 0, rect.x1 / k, rect.y1 / k);
+            let doc = d.working.as_ref().unwrap();
+            let img = e.evaluate_with(&EvalRequest { doc, rect: r, mip, format: EvalFormat::F16, source: RenderSource::LayerStack }, d.stroke.as_ref().map(|s| &s.gpu)).unwrap();
+            Readback::start(&e.ctx.device, &e.ctx.queue, &img, r).wait(&e.ctx.device)
+        };
+        at(&mut d, &mut e, Phase::Down, 40.0);
+        // Frame by frame across the canvas (and one level down): each cached view equals a
+        // view composed from scratch, and late frames redraw a few tiles, not all of them.
+        for (i, x) in (60..3960).step_by(40).enumerate() {
+            at(&mut d, &mut e, Phase::Move, x as f32);
+            let mip = (i % 7 == 6) as u32;
+            prisme_core::perf::begin_frame(i as u64);
+            let cached = render(&mut e, &d, mip);
+            let redrawn = prisme_core::perf::end_frame().counters.iter().find(|c| c.0 == "stroke view tiles").map_or(0, |c| c.1);
+            assert_eq!(cached, render(&mut Engine::new(ctx.clone()), &d, mip), "frame {i}");
+            let live = d.stroke.as_ref().unwrap().gpu.live_tile_count();
+            if i > 30 && mip == 0 && (i - 1) % 7 != 6 {
+                assert!(redrawn * 3 < live as u64, "frame {i}: redrew {redrawn} of {live} tiles");
+            }
+        }
+        at(&mut d, &mut e, Phase::Up, 3960.0);
     }
 
     #[test]
