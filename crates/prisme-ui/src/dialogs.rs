@@ -564,48 +564,45 @@ fn misc(s: &mut AppState, ctx: &egui::Context) {
     }
     if let Some(i) = s.dialogs.confirm_close {
         let name = s.docs.get(i).map(|d| d.doc().info.name.clone()).unwrap_or_default();
-        Window::new("Unsaved changes").collapsible(false).resizable(false).show(ctx, |ui| {
+        let pick = confirm(ctx, "Unsaved changes", &["Save", "Don't save", "Cancel"], |ui| {
             ui.label(format!("“{name}” has unsaved changes."));
-            ui.horizontal(|ui| {
-                if ui.button("Save").clicked() {
-                    s.dialogs.confirm_close = None;
-                    if let Some(id) = s.docs.get(i).map(|d| d.id) {
-                        s.dialogs.close_after_save.push(id);
-                        crate::jobs::save_doc(s, i, false);
-                    }
-                }
-                if ui.button("Don't save").clicked() {
-                    crate::commands::close_doc(s, i);
-                }
-                if ui.button("Cancel").clicked() {
-                    s.dialogs.confirm_close = None;
-                }
-            });
         });
+        match pick {
+            Some(0) => {
+                s.dialogs.confirm_close = None;
+                if let Some(id) = s.docs.get(i).map(|d| d.id) {
+                    s.dialogs.close_after_save.push(id);
+                    crate::jobs::save_doc(s, i, false);
+                }
+            }
+            Some(1) => crate::commands::close_doc(s, i),
+            Some(_) => s.dialogs.confirm_close = None,
+            None => {}
+        }
     }
     if s.dialogs.confirm_quit {
         let names: Vec<String> = s.docs.iter().filter(|d| d.is_dirty()).map(|d| d.doc().info.name.clone()).collect();
-        Window::new("Quit Prisme?").collapsible(false).resizable(false).show(ctx, |ui| {
+        let save = if names.len() == 1 { "Save" } else { "Save all" };
+        let pick = confirm(ctx, "Quit Prisme?", &[save, "Don't save", "Cancel"], |ui| {
             ui.label(if names.len() == 1 { "This document has unsaved changes:".to_string() } else { format!("{} documents have unsaved changes:", names.len()) });
             for n in &names {
                 ui.label(RichText::new(format!("• {n}")).color(theme::TEXT_DIM));
             }
-            ui.horizontal(|ui| {
-                if ui.button(if names.len() == 1 { "Save" } else { "Save all" }).clicked() {
-                    s.dialogs.confirm_quit = false;
-                    s.dialogs.quit_after_save = true;
-                }
-                if ui.button("Don't save").clicked() {
-                    crate::jobs::discard_autosaves(s);
-                    s.dialogs.confirm_quit = false;
-                    s.dialogs.allow_quit = true;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-                if ui.button("Cancel").clicked() {
-                    s.dialogs.confirm_quit = false;
-                }
-            });
         });
+        match pick {
+            Some(0) => {
+                s.dialogs.confirm_quit = false;
+                s.dialogs.quit_after_save = true;
+            }
+            Some(1) => {
+                crate::jobs::discard_autosaves(s);
+                s.dialogs.confirm_quit = false;
+                s.dialogs.allow_quit = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Some(_) => s.dialogs.confirm_quit = false,
+            None => {}
+        }
     }
     if let Some((op, mut amount)) = s.dialogs.modify_sel.clone() {
         let mut open = true;
@@ -640,4 +637,29 @@ fn misc(s: &mut AppState, ctx: &egui::Context) {
             }
         });
     }
+}
+
+/// Centred modal confirmation. Keyboard focus stays inside it: the first button starts
+/// focused, Tab/arrows move, Enter/Space press, Escape picks the last (cancel) button.
+/// Returns the index of the button chosen this frame.
+fn confirm(ctx: &egui::Context, title: &str, buttons: &[&str], body: impl FnOnce(&mut egui::Ui)) -> Option<usize> {
+    let mut pick = None;
+    egui::Modal::new(egui::Id::new(("confirm", title))).show(ctx, |ui| {
+        ui.set_min_width(260.0);
+        ui.label(RichText::new(title).strong().size(15.0));
+        ui.add_space(4.0);
+        body(ui);
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            let resps: Vec<egui::Response> = buttons.iter().map(|b| ui.button(*b)).collect();
+            if !resps.iter().any(|r| r.has_focus()) {
+                resps[0].request_focus();
+            }
+            pick = resps.iter().position(|r| r.clicked());
+        });
+    });
+    if pick.is_none() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        pick = Some(buttons.len() - 1);
+    }
+    pick
 }

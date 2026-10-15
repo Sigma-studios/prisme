@@ -15,6 +15,10 @@ use std::sync::Arc;
 // ------------------------------------------------------------------ shortcuts
 
 pub fn handle_shortcuts(s: &mut AppState, ctx: &egui::Context) {
+    // A confirmation dialog owns the keyboard (Enter/Escape answer it).
+    if s.dialogs.confirm_close.is_some() || s.dialogs.confirm_quit {
+        return;
+    }
     // Rebinding in the shortcuts tab swallows the keyboard.
     if crate::shortcuts::capture(s, ctx) {
         return;
