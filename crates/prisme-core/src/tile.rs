@@ -117,12 +117,9 @@ impl Tile {
             return None;
         }
         let buf = match format {
-            PixelFormat::F16 => TileBuf::F16(
-                bytes.chunks_exact(2).map(|c| f16::from_bits(u16::from_le_bytes([c[0], c[1]]))).collect(),
-            ),
-            PixelFormat::F32 => TileBuf::F32(
-                bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
-            ),
+            // Little-endian bytes: a bulk copy (any alignment) on every target we build.
+            PixelFormat::F16 => TileBuf::F16(bytemuck::pod_collect_to_vec(bytes)),
+            PixelFormat::F32 => TileBuf::F32(bytemuck::pod_collect_to_vec(bytes)),
         };
         Some(Tile { id: next_tile_id(), channels, buf })
     }

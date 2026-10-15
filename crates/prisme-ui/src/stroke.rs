@@ -16,15 +16,23 @@
 //!
 //! A Free Transform preview is a stroke that never lands: it lives while the tool's session
 //! is open, and applying it resamples the layer on the CPU in the tool.
+//!
+//! Strokes on f16 targets (the usual case) come back as finished f16 tiles converted on the
+//! GPU (`prisme_gpu::pack`, bit-identical to converting an f32 read-back here): half the bytes,
+//! no conversion, and the same tile goes into the history and the working copy. Their GPU
+//! bits are then handed to the tile store ([`DocState::adopt`], taken by the canvas before it
+//! renders), so the landed tiles aren't uploaded again.
 
 use crate::app::AppState;
 use crate::doc::DocState;
 use prisme_brush::Dab;
 use prisme_core::tile::{TileCoord, TileGrid};
 use prisme_core::Document;
-use prisme_gpu::{Engine, GpuStroke, Readback, UploadKey};
+use prisme_core::tile::Tile;
+use prisme_core::PixelFormat;
+use prisme_gpu::{Engine, GpuStroke, PackedTiles, Readback, UploadKey};
 use prisme_tools::liquify::{apply_cpu, LiquifyField};
-use prisme_tools::stroke::{dab_tiles, replay_stroke, write_stroke};
+use prisme_tools::stroke::{dab_tiles, replay_stroke, target_grid, write_stroke};
 use prisme_tools::{LiquifySpec, PaintTarget, StrokeOp, StrokeSpec, ToolKey, ToolKind};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -39,6 +47,47 @@ enum Replay {
     None,
 }
 
+/// How a finished stroke comes back from the GPU.
+enum Back {
+    /// f32 pixels per tile region (f32 targets), or the Liquify bake.
+    F32(Vec<Readback>),
+    /// Whole tiles already in f16 (f16 targets).
+    F16(PackedTiles),
+}
+
+/// What arrived.
+enum Landed {
+    F32(Vec<Vec<f32>>),
+    F16(Vec<Tile>),
+}
+
+impl Back {
+    fn ready(&self, device: &prisme_gpu::wgpu::Device) -> bool {
+        match self {
+            Back::F32(rbs) => rbs.iter().all(|rb| rb.ready(device)),
+            Back::F16(p) => p.ready(device),
+        }
+    }
+
+    fn take(&self, device: &prisme_gpu::wgpu::Device) -> Option<Landed> {
+        match self {
+            Back::F32(rbs) => rbs.iter().map(|rb| rb.try_take(device)).collect::<Option<Vec<_>>>().map(Landed::F32),
+            Back::F16(p) => p.take(device).map(Landed::F16),
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn wait(&self, device: &prisme_gpu::wgpu::Device) -> Option<Landed> {
+        match self {
+            Back::F32(rbs) => Some(Landed::F32(rbs.iter().map(|rb| rb.wait(device)).collect())),
+            Back::F16(p) => {
+                p.wait(device);
+                p.take(device).map(Landed::F16)
+            }
+        }
+    }
+}
+
 pub struct DocStroke {
     pub gpu: GpuStroke,
     target: PaintTarget,
@@ -48,8 +97,7 @@ pub struct DocStroke {
     tiles: HashSet<TileCoord>,
     /// Set once the tool ended the stroke; it then waits for `readback`.
     label: Option<String>,
-    /// One per tile (dab strokes) or one for the bake (Liquify).
-    readback: Option<Vec<Readback>>,
+    readback: Option<Back>,
     device: prisme_gpu::wgpu::Device,
 }
 
@@ -83,7 +131,7 @@ pub fn feed(d: &mut DocState, engine: &mut Engine, ops: Vec<StrokeOp>) {
             }
             StrokeOp::End(label) => {
                 if let Some(s) = d.stroke.as_mut().filter(|s| s.label.is_none()) {
-                    s.readback = engine.stroke_readback(&s.gpu);
+                    s.readback = engine.stroke_pack(&s.gpu).map(Back::F16).or_else(|| engine.stroke_readback(&s.gpu).map(Back::F32));
                     s.label = Some(label);
                 }
             }
@@ -105,7 +153,7 @@ pub fn feed(d: &mut DocState, engine: &mut Engine, ops: Vec<StrokeOp>) {
                 if let Some(s) = d.stroke.as_mut().filter(|s| s.label.is_none() && s.gpu.is_liquify()) {
                     let r = field.active_rect();
                     s.tiles = TileGrid::coords_in(&r).collect();
-                    s.readback = engine.liquify_readback(&s.gpu, r, true).map(|rb| vec![rb]);
+                    s.readback = engine.liquify_readback(&s.gpu, r, true).map(|rb| Back::F32(vec![rb]));
                     if let Replay::Liquify(_, f) = &mut s.replay {
                         *f = Some(field);
                     }
@@ -192,9 +240,9 @@ impl DocState {
         }
         let s = self.stroke.take().unwrap();
         #[cfg(not(target_arch = "wasm32"))]
-        let px = s.readback.as_ref().map(|rbs| rbs.iter().map(|rb| rb.wait(&s.device)).collect());
+        let px = s.readback.as_ref().and_then(|b| b.wait(&s.device));
         #[cfg(target_arch = "wasm32")]
-        let px = s.readback.as_ref().filter(|rbs| rbs.iter().all(|rb| rb.ready(&s.device))).and_then(|rbs| rbs.iter().map(|rb| rb.try_take(&s.device)).collect());
+        let px = s.readback.as_ref().filter(|b| b.ready(&s.device)).and_then(|b| b.take(&s.device));
         self.land(s, px);
     }
 
@@ -202,8 +250,8 @@ impl DocState {
     fn poll_stroke(&mut self) -> bool {
         let Some(s) = self.stroke.as_ref().filter(|s| s.label.is_some()) else { return false };
         let px = match &s.readback {
-            Some(rbs) if !rbs.iter().all(|rb| rb.ready(&s.device)) => return true,
-            Some(rbs) => rbs.iter().map(|rb| rb.try_take(&s.device)).collect(),
+            Some(b) if !b.ready(&s.device) => return true,
+            Some(b) => b.take(&s.device),
             None => None,
         };
         let s = self.stroke.take().unwrap();
@@ -212,21 +260,52 @@ impl DocState {
     }
 
     /// Write the stroke into the tiles as one history entry (and into an open working copy).
-    fn land(&mut self, s: DocStroke, px: Option<Vec<Vec<f32>>>) {
+    fn land(&mut self, s: DocStroke, px: Option<Landed>) {
+        let (px, half) = match px {
+            Some(Landed::F32(v)) => (Some(v), None),
+            Some(Landed::F16(t)) => (None, Some(t)),
+            None => (None, None),
+        };
         // All parts must have arrived intact, or the CPU replays the whole stroke.
         let parts = match (&px, &s.readback) {
-            (Some(px), Some(rbs)) if px.len() == rbs.len() && px.iter().zip(rbs).all(|(p, rb)| p.len() == rb.rect.area() as usize * s.channels) => Some(rbs.iter().zip(px)),
+            (Some(px), Some(Back::F32(rbs))) if px.len() == rbs.len() && px.iter().zip(rbs).all(|(p, rb)| p.len() == rb.rect.area() as usize * s.channels) => {
+                Some(rbs.iter().zip(px))
+            }
+            _ => None,
+        };
+        // f16 tiles: one shared tile per coordinate (None: the stroke cleared it).
+        let tiles: Option<Vec<(TileCoord, Option<Arc<Tile>>)>> = match (half, &s.readback) {
+            (Some(t), Some(Back::F16(p))) if t.len() == p.coords.len() && p.channels() as usize == s.channels => Some(
+                p.coords
+                    .iter()
+                    .zip(t)
+                    .filter(|(c, _)| s.tiles.contains(c))
+                    .map(|(c, t)| (*c, (s.base_default != 0.0 || !t.is_clear()).then(|| Arc::new(t))))
+                    .collect(),
+            ),
             _ => None,
         };
         let apply = |doc: &mut Document| {
-            let written = match parts.clone() {
-                Some(parts) => {
+            let written = match (parts.clone(), &tiles) {
+                (Some(parts), _) => {
                     for (rb, px) in parts {
                         write_stroke(doc, s.target, s.base_default, rb.rect, px, s.channels, TileGrid::coords_in(&rb.rect).filter(|c| s.tiles.contains(c)));
                     }
                     true
                 }
-                None => false,
+                (None, Some(tiles)) => match target_grid(doc, s.target).filter(|g| g.format == PixelFormat::F16 && g.channels as usize == s.channels) {
+                    Some(g) => {
+                        for (c, t) in tiles {
+                            match t {
+                                Some(t) => g.tiles.insert(*c, t.clone()),
+                                None => g.tiles.remove(c),
+                            };
+                        }
+                        true
+                    }
+                    None => false,
+                },
+                (None, None) => false,
             };
             if !written {
                 match &s.replay {
@@ -240,6 +319,15 @@ impl DocState {
         apply(&mut doc);
         if let Some(w) = &mut self.working {
             apply(w);
+        }
+        let adopt = |doc: &mut Document| target_grid(doc, s.target).is_some_and(|g| g.format == PixelFormat::F16);
+        if let (Some(tiles), true) = (&tiles, adopt(&mut doc)) {
+            // Hand the landed tiles' GPU bits to the tile store (ids in `coords` order).
+            let ids: std::collections::HashMap<TileCoord, u64> = tiles.iter().filter_map(|(c, t)| t.as_ref().map(|t| (*c, t.id()))).collect();
+            if let Some(Back::F16(p)) = s.readback {
+                let ids = p.coords.iter().map(|c| ids.get(c).copied().unwrap_or(0)).collect();
+                self.adopt = Some((p, ids));
+            }
         }
         self.history.push(s.label.clone().unwrap_or_default(), doc);
         self.touch();
@@ -329,6 +417,43 @@ mod tests {
         assert_eq!(input(&mut d, &mut e, t.as_mut(), &o, Err(ToolKey::Escape)), ToolOutcome::Cancel);
         assert!(d.stroke.is_none() && d.history.cursor() == 0);
         assert_eq!(layer(d.doc()), before);
+    }
+
+    #[test]
+    fn f16_stroke_lands_as_shared_tiles_and_is_adopted_without_upload() {
+        use prisme_gpu::{EvalFormat, EvalRequest, Readback, RenderSource};
+        let Some(ctx) = pollster::block_on(prisme_gpu::GpuContext::headless()) else { return eprintln!("no GPU adapter; skipping") };
+        let mut e = Engine::new(ctx.clone());
+        let mut doc = Document::with_background("t", 600, 400, Some([1.0; 4]));
+        let id = doc.active_layer.unwrap();
+        assert_eq!(doc.layer(id).unwrap().raster().unwrap().format, PixelFormat::F16);
+        doc.layer_mut(id).unwrap().raster_mut().unwrap().map_rect(&IRect::new(50, 50, 300, 300), |x, y, p| p.copy_from_slice(&[x as f32 / 600.0, y as f32 / 400.0, 0.4, 1.0]));
+        let mut d = DocState::new(doc);
+        let rect = IRect::new(0, 0, 600, 400);
+        let render = |e: &mut Engine, doc: &Document| {
+            let img = e.evaluate(&EvalRequest { doc, rect, mip: 0, format: EvalFormat::F16, source: RenderSource::LayerStack }).unwrap();
+            Readback::start(&e.ctx.device, &e.ctx.queue, &img, rect).wait(&e.ctx.device)
+        };
+        render(&mut e, d.history.current());
+        let mut o = ToolOptions::default();
+        o.brush.size = 80.0;
+        let mut t = make_tool(ToolKind::Brush);
+        drag(&mut d, &mut e, t.as_mut(), &o, [40.0, 60.0], [560.0, 340.0]);
+        assert!(d.stroke_pending());
+        d.finish_stroke();
+        assert_eq!(d.history.cursor(), 1);
+        // Landed through the f16 path: the store handoff is queued with the landed tiles' ids.
+        let (p, ids) = d.adopt.take().expect("f16 landing");
+        let g = d.history.current().layer(id).unwrap().raster().unwrap().clone();
+        let landed: Vec<u64> = ids.iter().copied().filter(|&i| i != 0).collect();
+        assert!(landed.len() > 4);
+        assert!(landed.iter().all(|i| g.tiles.values().any(|t| t.id() == *i)), "ids are the document's tiles");
+        // The store takes them over: the next render uploads nothing and matches a fresh engine.
+        let before = e.tile_stats();
+        e.adopt_tiles(&p, &ids);
+        let px = render(&mut e, d.history.current());
+        assert_eq!(e.tile_stats().0, before.0, "landed tiles were uploaded again");
+        assert_eq!(px, render(&mut Engine::new(ctx), d.history.current()));
     }
 
     #[test]

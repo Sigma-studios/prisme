@@ -290,3 +290,128 @@ fn preview_splices_stroke() {
     let px = Readback::start(&e.ctx.device, &e.ctx.queue, &img, IRect::new(40, 60, 41, 61)).wait(&e.ctx.device);
     assert!((px[0] - 0.5).abs() < 1e-4, "{px:?}");
 }
+
+/// Land through `stroke_pack` (f16 bits converted on the GPU) instead of the f32 read-back.
+fn gpu_f16(e: &mut Engine, d: &Document, sp: &StrokeSpec, dabs: &[Dab]) -> Document {
+    let mut s = e.stroke_begin(key(sp.target), sp.base.clone(), sp.base_default, sp.selection.clone(), sp.mode);
+    for c in dabs.chunks(7) {
+        e.stroke_dabs(&mut s, c);
+    }
+    let mut out = d.clone();
+    let mut mine = HashSet::new();
+    dab_tiles(dabs, &mut mine);
+    let p = e.stroke_pack(&s).expect("f16 target");
+    p.wait(&e.ctx.device);
+    let tiles = p.take(&e.ctx.device).expect("tiles");
+    let g = prisme_tools::stroke::target_grid(&mut out, sp.target).unwrap();
+    for (c, t) in p.coords.iter().zip(tiles) {
+        if mine.contains(c) {
+            if sp.base_default == 0.0 && t.is_clear() {
+                g.tiles.remove(c);
+            } else {
+                g.insert(*c, t);
+            }
+        }
+    }
+    out
+}
+
+fn tile_bits(g: &TileGrid) -> Vec<(i32, i32, Vec<u8>)> {
+    let mut v: Vec<_> = g.tiles.iter().map(|(c, t)| (c.x, c.y, t.to_bytes())).collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn f16_landing_matches_f32_readback_bit_for_bit() {
+    let Some(mut e) = engine() else { return };
+    let mut d = doc(PixelFormat::F16);
+    let id = d.active_layer.unwrap();
+    let mut m = TileGrid::mask();
+    m.map_rect(&IRect::new(0, 0, 150, 200), |x, _, p| p[0] = x as f32 / 150.0);
+    d.layer_mut(id).unwrap().mask = Some(LayerMask { grid: Arc::new(m), enabled: true, default_visible: true });
+    let pts: Vec<[f32; 2]> = (0..40).map(|i| [20.0 + i as f32 * 7.0, 30.0 + (i as f32 * 0.4).sin() * 60.0 + i as f32 * 2.0]).collect();
+    let soft = BrushSettings { size: 70.0, hardness: 0.3, ..Default::default() };
+    let content = PaintTarget { layer: id, mask: false, saved: None };
+    let mask = PaintTarget { layer: id, mask: true, saved: None };
+    let paint = StrokeMode::Paint { target: BlendTarget::Color([0.8, 0.31, 0.07, 0.9]), opacity: 0.85, lock_alpha: false };
+    let cases = [
+        ("paint", content, paint),
+        ("erase", content, StrokeMode::Paint { target: BlendTarget::Erase, opacity: 0.6, lock_alpha: false }),
+        ("smudge", content, StrokeMode::Retouch(RetouchMode::Smudge { strength: 0.7 })),
+        ("mask", mask, StrokeMode::Paint { target: BlendTarget::Value(0.0), opacity: 0.7, lock_alpha: false }),
+    ];
+    for (name, t, mode) in cases {
+        let sp = spec(&d, t, mode, None);
+        let ds = dabs(soft.clone(), &pts);
+        let a = gpu(&mut e, &d, &sp, &ds);
+        let b = gpu_f16(&mut e, &d, &sp, &ds);
+        let (ga, gb) = (grid(&a, t), grid(&b, t));
+        assert_eq!(tile_bits(&ga), tile_bits(&gb), "{name}: f16 landing differs from the f32 read-back");
+        assert!(tile_bits(&ga) != tile_bits(&grid(&d, t)), "{name}: stroke changed something");
+    }
+}
+
+#[test]
+fn f16_packing_rounds_like_the_half_crate() {
+    let Some(mut e) = engine() else { return };
+    // Edge cases first: zeros, subnormal boundaries, ties around every rounding position,
+    // max/overflow, infinities, NaNs; then random bit patterns.
+    let mut vals: Vec<f32> = vec![0.0, -0.0, 1.0, -1.0, 65504.0, 65519.0, 65520.0, 1e9, -1e9, f32::INFINITY, f32::NEG_INFINITY, f32::MIN_POSITIVE, 5.96e-8, 2.98e-8, 2.99e-8, 6.1e-5, 6.09e-5];
+    for h in [0x0001u16, 0x03FF, 0x0400, 0x3C00, 0x3C01, 0x7BFF, 0x0002, 0x0003] {
+        let f = half::f16::from_bits(h).to_f32();
+        let next = half::f16::from_bits(h + 1).to_f32();
+        let mid = (f + next) / 2.0;
+        vals.extend([f, mid, f32::from_bits(mid.to_bits() + 1), f32::from_bits(mid.to_bits() - 1), -mid]);
+    }
+    let mut x: u32 = 0x1234_5678;
+    while vals.len() < 256 * 256 * 4 {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        // Mostly the f16 range, some anywhere.
+        let v = if x.is_multiple_of(8) { f32::from_bits(x) } else { f32::from_bits((x & 0x87FF_FFFF) | 0x3000_0000) };
+        vals.push(v);
+    }
+    let tex = |format: wgpu::TextureFormat, data: &[u8], bpp: u32| {
+        let t = e.ctx.device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d { width: 256, height: 256, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        e.ctx.queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &t, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            data,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(256 * bpp), rows_per_image: Some(256) },
+            wgpu::Extent3d { width: 256, height: 256, depth_or_array_layers: 1 },
+        );
+        let view = t.create_view(&Default::default());
+        prisme_gpu::GpuImage { tex: Arc::new(prisme_gpu::image::PooledTex { tex: t, view, w: 256, h: 256, format }), rect: IRect::new(0, 0, 256, 256), straight: true }
+    };
+    let rgba = tex(wgpu::TextureFormat::Rgba32Float, bytemuck::cast_slice(&vals), 16);
+    let r = tex(wgpu::TextureFormat::R32Float, bytemuck::cast_slice(&vals[..256 * 256]), 4);
+    let c = prisme_core::tile::TileCoord::new(0, 0);
+    for (img, ch, src) in [(rgba, 4u8, &vals[..]), (r, 1, &vals[..256 * 256])] {
+        let p = e.pack_tiles(&[(c, img)], ch);
+        p.wait(&e.ctx.device);
+        let bytes = p.take(&e.ctx.device).unwrap().remove(0).to_bytes();
+        let got: Vec<u16> = bytemuck::pod_collect_to_vec(&bytes);
+        let mut bad = 0;
+        for (i, (&v, &g)) in src.iter().zip(&got).enumerate() {
+            let want = half::f16::from_f32(v);
+            let ok = if want.is_nan() { half::f16::from_bits(g).is_nan() } else { g == want.to_bits() };
+            if !ok {
+                if bad < 5 {
+                    eprintln!("ch {ch} #{i}: {v:e} ({:#010x}) -> gpu {g:#06x}, half {:#06x}", v.to_bits(), want.to_bits());
+                }
+                bad += 1;
+            }
+        }
+        assert_eq!(bad, 0, "{ch} channels: {bad} values rounded differently");
+    }
+}

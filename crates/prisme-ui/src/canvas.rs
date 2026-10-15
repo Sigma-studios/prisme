@@ -402,6 +402,10 @@ fn render(s: &mut AppState, ctx: &egui::Context, rect: Rect, ppp: f32, painter: 
         return;
     };
     let d = &mut s.docs[active];
+    // A stroke just landed: its tiles are already on the GPU, don't upload them again.
+    if let Some((p, ids)) = d.adopt.take() {
+        g.engine.adopt_tiles(&p, &ids);
+    }
     let doc = d.working.as_ref().unwrap_or_else(|| d.history.current());
     let infinite = doc.info.is_infinite();
     let center = rect.center();

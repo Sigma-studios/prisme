@@ -96,6 +96,9 @@ pub struct DocState {
     pub outline: Option<(u64, Vec<Vec<[f32; 2]>>)>,
     /// GPU brush stroke being painted or waiting to land (see `crate::stroke`).
     pub stroke: Option<crate::stroke::DocStroke>,
+    /// Tiles of the last f16 stroke landing, for the canvas to hand to the GPU tile store
+    /// (`Engine::adopt_tiles`): their bits, and the tile id each was landed under.
+    pub adopt: Option<(prisme_gpu::PackedTiles, Vec<u64>)>,
     /// Document-space rect visible on the canvas at the last frame (area fills on infinite
     /// canvases).
     pub view_rect: prisme_core::IRect,
@@ -123,6 +126,7 @@ impl DocState {
             placeholder: None,
             outline: None,
             stroke: None,
+            adopt: None,
             view_rect: prisme_core::IRect::EMPTY,
         }
     }

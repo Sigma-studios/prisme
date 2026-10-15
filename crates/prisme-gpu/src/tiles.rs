@@ -212,12 +212,14 @@ pub struct TileStore {
     /// Tiles uploaded / built on the GPU since creation (tests, profiling).
     pub uploads: u64,
     pub builds: u64,
+    /// Tiles taken over from landed strokes (no upload).
+    pub adopted: u64,
 }
 
 impl TileStore {
     pub fn new(device: wgpu::Device, queue: wgpu::Queue, budget: u64) -> Self {
         let max_layers = device.limits().max_texture_array_layers.min(MAX_PAGE_LAYERS);
-        Self { device, queue, pages: HashMap::new(), resident: HashMap::new(), constants: HashMap::new(), frame: 0, bytes: 0, budget, max_layers, uploads: 0, builds: 0 }
+        Self { device, queue, pages: HashMap::new(), resident: HashMap::new(), constants: HashMap::new(), frame: 0, bytes: 0, budget, max_layers, uploads: 0, builds: 0, adopted: 0 }
     }
 
     pub fn begin_frame(&mut self) {
@@ -336,6 +338,24 @@ impl TileStore {
     pub fn resident(&mut self, class: Class, pyr: &Pyramid, mip: u32, c: TileCoord, default: f32) -> bool {
         let id = pyr.key(mip, c);
         self.touch(&(class, mip, id, if mip == 0 { 0 } else { default.to_bits() })).is_some()
+    }
+
+    /// Make the level-0 tile `id` resident from bits already on the GPU (`src`: buffer and
+    /// offset, tile layout in this class's texel format).
+    pub fn adopt(&mut self, enc: &mut wgpu::CommandEncoder, class: Class, id: u64, src: (&wgpu::Buffer, u64)) {
+        let key: Key = (class, 0, id, 0);
+        if self.touch(&key).is_some() {
+            return;
+        }
+        let slot = self.alloc(class);
+        let bpp = class.format().block_copy_size(None).unwrap_or(16);
+        enc.copy_buffer_to_texture(
+            wgpu::TexelCopyBufferInfo { buffer: src.0, layout: wgpu::TexelCopyBufferLayout { offset: src.1, bytes_per_row: Some(TILE_SIZE * bpp), rows_per_image: Some(TILE_SIZE) } },
+            wgpu::TexelCopyTextureInfo { texture: &self.pages[&class][slot.page as usize].tex, mip_level: 0, origin: wgpu::Origin3d { x: 0, y: 0, z: slot.layer }, aspect: wgpu::TextureAspect::All },
+            wgpu::Extent3d { width: TILE_SIZE, height: TILE_SIZE, depth_or_array_layers: 1 },
+        );
+        self.adopted += 1;
+        self.resident.insert(key, Resident { slot, last_used: self.frame });
     }
 
     /// A tile filled with `value` (missing tiles of masks that reveal by default).

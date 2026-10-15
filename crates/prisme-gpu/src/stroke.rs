@@ -206,6 +206,8 @@ fn snapshot(device: &wgpu::Device, queue: &wgpu::Queue, grid: &TileGrid, rect: I
 /// Tile state of a dab stroke.
 struct Brush {
     mode: StrokeMode,
+    /// The target stores f16: the stroke can land through [`Engine::stroke_pack`].
+    half: bool,
     base: Source,
     sel: Option<Source>,
     live: TileSet,
@@ -345,6 +347,7 @@ impl Engine {
         let paint = matches!(mode, StrokeMode::Paint { .. });
         let brush = Brush {
             mode,
+            half: base.format == prisme_core::tile::PixelFormat::F16,
             base: Source::new(base, base_default),
             sel: selection.map(|s| Source::new(s, 0.0)),
             live: TileSet::new(format_for(channels)),
@@ -474,6 +477,30 @@ impl Engine {
     /// Start reading the finished stroke back, one readback per touched tile (async; poll
     /// with [`Readback::ready`]). None when there's nothing to read or the stroke overflowed
     /// (land it on the CPU).
+    /// Land a stroke on an f16 target: its whole live tiles (base outside the stroke) converted
+    /// to f16 on the GPU and read back as tiles, bit-identical to converting the f32 read-back
+    /// on the CPU. None on overflow, for f32 targets, or with nothing painted.
+    pub fn stroke_pack(&mut self, s: &GpuStroke) -> Option<crate::pack::PackedTiles> {
+        let Kind::Brush(b) = &s.kind else { return None };
+        if s.overflow || !b.half {
+            return None;
+        }
+        let mut tiles: Vec<(TileCoord, GpuImage)> = s.live_tiles().filter(|(c, _)| !c.rect().intersect(&s.dirty).is_empty()).map(|(c, t)| (c, t.clone())).collect();
+        if tiles.is_empty() {
+            return None;
+        }
+        tiles.sort_unstable_by_key(|(c, _)| (c.y, c.x));
+        Some(self.pack_tiles(&tiles, s.channels))
+    }
+
+    /// Convert f32 tile textures (`channels` 1 or 4) to f16 tiles on the GPU and start reading
+    /// them back (see [`crate::pack`]).
+    pub fn pack_tiles(&mut self, tiles: &[(TileCoord, GpuImage)], channels: u8) -> crate::pack::PackedTiles {
+        let device = self.ctx.device.clone();
+        let p = self.pack.get_or_insert_with(|| crate::pack::PackPipelines::new(&device));
+        crate::pack::PackedTiles::start(&self.ctx.device, &self.ctx.queue, p, tiles, channels)
+    }
+
     pub fn stroke_readback(&self, s: &GpuStroke) -> Option<Vec<Readback>> {
         if s.overflow {
             return None;

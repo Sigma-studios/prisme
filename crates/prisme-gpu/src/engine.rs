@@ -81,6 +81,8 @@ pub struct Engine {
     pub last_stats: EvalStats,
     /// Free texture bytes the pool keeps, and the frame that set it (see `evaluate_with`).
     pool_keep: (u64, u64),
+    /// f16 landing pipelines (created on first use).
+    pub(crate) pack: Option<crate::pack::PackPipelines>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -138,6 +140,7 @@ impl Engine {
             frame: 0,
             last_stats: EvalStats::default(),
             pool_keep: (0, 0),
+            pack: None,
         }
     }
 
@@ -183,6 +186,23 @@ impl Engine {
         }
         self.ctx.queue.submit([enc.finish()]);
         done
+    }
+
+    /// Hand landed f16 tiles to the tile store: `ids[i]` is the id the document gave
+    /// `p.coords[i]`'s tile (0: not kept). The store copies their bits from the GPU buffers they
+    /// were read back from, so views don't upload them again. RGBA only (masks are stored as
+    /// f32 on the GPU and upload as usual).
+    pub fn adopt_tiles(&mut self, p: &crate::pack::PackedTiles, ids: &[u64]) {
+        if p.channels() != 4 {
+            return;
+        }
+        let mut enc = self.ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("adopt") });
+        for (i, &id) in ids.iter().enumerate() {
+            if let (true, Some(src)) = (id != 0, p.bits(i)) {
+                self.uploads.store.adopt(&mut enc, crate::tiles::Class::Rgba16, id, src);
+            }
+        }
+        self.ctx.queue.submit([enc.finish()]);
     }
 
     /// VRAM the resident tiles may hold (default 1 GiB).
