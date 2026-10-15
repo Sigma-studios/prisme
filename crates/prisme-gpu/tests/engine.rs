@@ -211,3 +211,29 @@ fn infinite_canvas_far_content() {
     let raw = eval(&mut engine, &doc, rect, 0, RenderSource::LayerStack);
     assert!(whole.iter().zip(&raw).any(|(a, b)| (a - b).abs() > 0.01));
 }
+
+#[test]
+fn growing_view_reuses_uploads_correctly() {
+    // Zooming out / panning grows a layer's upload: resident tiles are carried over by a GPU
+    // copy, empty ones are left to the zeroed texture. The result must match a fresh engine.
+    let Some(ctx) = ctx() else { eprintln!("no GPU adapter; skipping"); return };
+    let mut e = Engine::new(ctx.clone());
+    let mut doc = Document::infinite("t", 800, 600, Some([1.0; 4]));
+    let id = doc.active_layer.unwrap();
+    let paint = |doc: &mut Document, r: IRect, c: [f32; 4]| {
+        doc.layer_mut(id).unwrap().raster_mut().unwrap().map_rect(&r, |x, y, p| p.copy_from_slice(&[c[0], c[1] * (x & 7) as f32 / 7.0, c[2] * (y & 7) as f32 / 7.0, c[3]]));
+    };
+    for (cx, cy) in [(-3000, -2000), (3000, 2000), (0, 0), (2500, -1800)] {
+        paint(&mut doc, IRect::new(cx - 200, cy - 150, cx + 200, cy + 150), [0.9, 0.5, 0.4, 0.8]);
+    }
+    let rects = [IRect::new(-500, -400, 500, 400), IRect::new(-1500, -1000, 1500, 1000), IRect::new(-3500, -2500, 1500, 1000), IRect::new(-3500, -2500, 3500, 2500)];
+    for (i, r) in rects.into_iter().enumerate() {
+        if i == 2 {
+            // A tile that's already resident changes: it must be rewritten after the carry-over.
+            paint(&mut doc, IRect::new(-100, -100, 100, 100), [0.1, 0.9, 0.2, 1.0]);
+        }
+        let got = eval(&mut e, &doc, r, 0, RenderSource::LayerStack);
+        let want = eval(&mut Engine::new(ctx.clone()), &doc, r, 0, RenderSource::LayerStack);
+        assert!(got == want, "step {i}: {r:?} differs from a fresh evaluation");
+    }
+}

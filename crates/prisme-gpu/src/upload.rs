@@ -137,8 +137,10 @@ impl UploadCache {
             e.mip == mip && e.f32 == f32 && e.default_value == default_value && e.image.rect.intersect(&want) == want
         });
         if !reusable {
-            // Allocate with one tile of margin (clipped to content) to absorb small pans.
-            let mut rect = want.expand(TS);
+            // Allocate with a quarter of the size as margin on each side (clipped to content)
+            // so pans and zoom-out steps keep reusing it.
+            let m = |v: i32| (v / 4).div_euclid(TS) * TS + TS;
+            let mut rect = IRect::new(want.x0 - m(want.width()), want.y0 - m(want.height()), want.x1 + m(want.width()), want.y1 + m(want.height()));
             if default_value == 0.0 {
                 rect = rect.intersect(&align(bounds));
             }
@@ -164,16 +166,35 @@ impl UploadCache {
             let view = tex.create_view(&Default::default());
             let pooled =
                 Arc::new(PooledTex { tex, view, w: rect.width() as u32, h: rect.height() as u32, format });
+            // Carry over the tiles the old texture already holds (same level and format): a
+            // GPU copy instead of rewriting them from the CPU.
+            let mut tiles = HashMap::new();
+            if let Some(old) = self.entries.remove(&key).filter(|e| e.mip == mip && e.f32 == f32 && e.default_value == default_value) {
+                let r = old.image.rect.intersect(&rect);
+                if !r.is_empty() {
+                    let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("upload-grow") });
+                    fn at(img: &PooledTex, origin: IRect, r: IRect) -> wgpu::TexelCopyTextureInfo<'_> {
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &img.tex,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d { x: (r.x0 - origin.x0) as u32, y: (r.y0 - origin.y0) as u32, z: 0 },
+                            aspect: wgpu::TextureAspect::All,
+                        }
+                    }
+                    enc.copy_texture_to_texture(at(&old.image.tex, old.image.rect, r), at(&pooled, rect, r), wgpu::Extent3d { width: r.width() as u32, height: r.height() as u32, depth_or_array_layers: 1 });
+                    queue.submit([enc.finish()]);
+                    tiles = old.tiles.into_iter().filter(|(c, _)| r.intersect(&c.rect()) == c.rect()).collect();
+                }
+            }
+            if default_value == 0.0 {
+                // New textures are zero-initialized: empty tiles are already right.
+                for c in TileGrid::coords_in(&rect) {
+                    tiles.entry(c).or_insert(0);
+                }
+            }
             self.entries.insert(
                 key,
-                Entry {
-                    image: GpuImage { tex: pooled, rect, straight: true },
-                    mip,
-                    f32,
-                    default_value,
-                    tiles: HashMap::new(),
-                    last_used: self.frame,
-                },
+                Entry { image: GpuImage { tex: pooled, rect, straight: true }, mip, f32, default_value, tiles, last_used: self.frame },
             );
         }
         let rect = self.entries[&key].image.rect;

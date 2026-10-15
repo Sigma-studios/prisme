@@ -451,7 +451,18 @@ fn render(s: &mut AppState, ctx: &egui::Context, rect: Rect, ppp: f32, painter: 
     if !reuse {
         // Evaluate a tile-aligned rect with one tile of margin to absorb small pans.
         let ts = 256;
-        let eval = clip(IRect::new(need.x0.div_euclid(ts) * ts - ts, need.y0.div_euclid(ts) * ts - ts, (need.x1 + ts - 1).div_euclid(ts) * ts + ts, (need.y1 + ts - 1).div_euclid(ts) * ts + ts));
+        let eval = IRect::new(need.x0.div_euclid(ts) * ts - ts, need.y0.div_euclid(ts) * ts - ts, (need.x1 + ts - 1).div_euclid(ts) * ts + ts, (need.y1 + ts - 1).div_euclid(ts) * ts + ts);
+        // Grow it to a quarter-octave size (the texture pool's buckets): zooming out, the
+        // next few frames still fit and skip evaluation, and the ones that don't reuse the
+        // same few texture sizes at every level instead of allocating.
+        let snap = |v: i32| {
+            let p = 1i32 << (31 - v.max(ts).leading_zeros());
+            let step = (p / 4).max(ts);
+            (v + step - 1) / step * step
+        };
+        let (pw, ph) = (snap(eval.width()) - eval.width(), snap(eval.height()) - eval.height());
+        let (l, t) = (pw / 2 / ts * ts, ph / 2 / ts * ts);
+        let eval = clip(IRect::new(eval.x0 - l, eval.y0 - t, eval.x1 + pw - l, eval.y1 + ph - t));
         let max = g.engine.ctx.max_texture_size() as i32;
         let eval = if eval.width() > max || eval.height() > max { need } else { eval };
         let img = g.engine.evaluate_with(&EvalRequest { doc, rect: eval, mip, format: EvalFormat::F16, source }, d.stroke.as_ref().map(|st| &st.gpu));

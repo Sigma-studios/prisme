@@ -81,6 +81,8 @@ pub struct Engine {
     frame: u64,
     /// Statistics of the last evaluation.
     pub last_stats: EvalStats,
+    /// Free texture bytes the pool keeps, and the frame that set it (see `evaluate_with`).
+    pool_keep: (u64, u64),
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -137,6 +139,7 @@ impl Engine {
             rasterizer: None,
             frame: 0,
             last_stats: EvalStats::default(),
+            pool_keep: (0, 0),
         }
     }
 
@@ -240,8 +243,32 @@ impl Engine {
         self.uploads.end_frame();
         self.mips.end_frame(4096);
         let fr = self.frame;
-        self.results.retain(|_, r| fr - r.last_used < 6);
-        self.pool.trim(256 << 20);
+        // Recent results, newest first, up to twice this one's size: while zooming every
+        // result has a new rect, and holding six full-view images blocks their textures'
+        // reuse (each step then allocates new ones).
+        let cap = 2 * result.byte_size();
+        let mut recent: Vec<(u64, u64)> = self.results.iter().filter(|(_, r)| fr - r.last_used < 6).map(|(k, r)| (r.last_used, *k)).collect();
+        recent.sort_unstable_by(|a, b| b.cmp(a));
+        let mut bytes = 0;
+        let keep: HashSet<u64> = recent
+            .into_iter()
+            .take_while(|(_, k)| {
+                bytes += self.results[k].image.byte_size();
+                bytes <= cap
+            })
+            .map(|(_, k)| k)
+            .collect();
+        self.results.retain(|k, r| keep.contains(k) || r.last_used == fr);
+        // Keep enough free textures for the next evaluation's intermediates: a fixed budget
+        // smaller than one full-view image (4K, infinite canvas) re-allocates and clears every
+        // texture on every pan or zoom step. Thumbnails interleave with the canvas, so the
+        // largest recent need sets it.
+        let px_bytes = if req.format == EvalFormat::F32 { 16 } else { 8 };
+        let need = req.rect.area() as u64 * px_bytes * 4;
+        if need >= self.pool_keep.0 || fr - self.pool_keep.1 > 300 {
+            self.pool_keep = (need, fr);
+        }
+        self.pool.trim((256u64 << 20).max(self.pool_keep.0));
         Some(result)
     }
 

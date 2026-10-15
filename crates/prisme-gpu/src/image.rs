@@ -34,6 +34,7 @@ impl GpuImage {
     }
 }
 
+
 /// Reuses textures whose only owner is the pool.
 pub struct TexturePool {
     device: wgpu::Device,
@@ -61,9 +62,20 @@ impl TexturePool {
             }
         }
         if let Some(i) = best {
-            return self.textures[i].clone();
+            // Most recently used last (`trim` drops from the front).
+            let t = self.textures.remove(i);
+            self.textures.push(t.clone());
+            return t;
         }
-        let round = |v: u32| v.div_ceil(64) * 64;
+        // Quarter-octave size buckets (…, 4096, 5120, 6144, 7168, 8192, …): the canvas
+        // evaluates between 1x and 2x the screen per axis whatever the zoom, so a view growing
+        // a little each frame (zooming out) lands in a few sizes it can reuse instead of
+        // allocating (and clearing) new textures every frame.
+        let round = |v: u32| {
+            let p = 1u32 << (31 - v.max(64).leading_zeros());
+            let step = (p / 4).max(64);
+            v.div_ceil(step) * step
+        };
         let (tw, th) = (round(w), round(h));
         let tex = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("prisme-pool"),
@@ -89,17 +101,25 @@ impl TexturePool {
         GpuImage { tex, rect, straight: false }
     }
 
-    /// Drop free textures beyond a budget (bytes).
+    /// Drop free textures beyond a budget (bytes), least recently used first.
     pub fn trim(&mut self, keep_free_bytes: u64) {
         let mut free = 0u64;
-        self.textures.retain(|t| {
-            if Arc::strong_count(t) > 1 {
-                return true;
-            }
-            let bpp = t.format.block_copy_size(None).unwrap_or(8) as u64;
-            free += t.w as u64 * t.h as u64 * bpp;
-            free <= keep_free_bytes
-        });
+        let mut keep: Vec<bool> = self
+            .textures
+            .iter()
+            .rev()
+            .map(|t| {
+                if Arc::strong_count(t) > 1 {
+                    return true;
+                }
+                let bpp = t.format.block_copy_size(None).unwrap_or(8) as u64;
+                free += t.w as u64 * t.h as u64 * bpp;
+                free <= keep_free_bytes
+            })
+            .collect();
+        keep.reverse();
+        let mut k = keep.into_iter();
+        self.textures.retain(|_| k.next().unwrap());
     }
 
     pub fn total_bytes(&self) -> u64 {
