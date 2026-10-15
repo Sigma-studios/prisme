@@ -30,7 +30,7 @@ use prisme_core::tile::{TileCoord, TileGrid};
 use prisme_core::Document;
 use prisme_core::tile::Tile;
 use prisme_core::PixelFormat;
-use prisme_gpu::{Engine, GpuStroke, PackedTiles, Readback, UploadKey};
+use prisme_gpu::{Engine, GpuStroke, PackedTiles, Readback, TakingTiles, UploadKey};
 use prisme_tools::liquify::{apply_cpu, LiquifyField};
 use prisme_tools::stroke::{dab_tiles, replay_stroke, target_grid, write_stroke};
 use prisme_tools::{LiquifySpec, PaintTarget, StrokeOp, StrokeSpec, ToolKey, ToolKind};
@@ -98,6 +98,9 @@ pub struct DocStroke {
     /// Set once the tool ended the stroke; it then waits for `readback`.
     label: Option<String>,
     readback: Option<Back>,
+    /// f16 tiles being built off the UI thread from the arrived read-back (native).
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    taking: Option<TakingTiles>,
     device: prisme_gpu::wgpu::Device,
 }
 
@@ -118,7 +121,7 @@ pub fn feed(d: &mut DocState, engine: &mut Engine, ops: Vec<StrokeOp>) {
                 let gpu = engine.stroke_begin(upload_key(spec.target), spec.base.clone(), spec.base_default, spec.selection.clone(), spec.mode);
                 let (target, base_default, channels) = (spec.target, spec.base_default, spec.base.channels as usize);
                 let replay = Replay::Dabs(spec, vec![]);
-                d.stroke = Some(DocStroke { gpu, target, base_default, channels, replay, tiles: HashSet::new(), label: None, readback: None, device: engine.ctx.device.clone() });
+                d.stroke = Some(DocStroke { gpu, target, base_default, channels, replay, tiles: HashSet::new(), label: None, readback: None, taking: None, device: engine.ctx.device.clone() });
             }
             StrokeOp::Dabs(v) => {
                 if let Some(s) = d.stroke.as_mut().filter(|s| s.label.is_none())
@@ -140,7 +143,7 @@ pub fn feed(d: &mut DocState, engine: &mut Engine, ops: Vec<StrokeOp>) {
                 let gpu = engine.liquify_begin(upload_key(spec.target), spec.base.clone(), spec.selection.clone(), spec.rect, spec.step, spec.nodes);
                 let (target, channels) = (spec.target, spec.base.channels as usize);
                 let replay = Replay::Liquify(spec, None);
-                d.stroke = Some(DocStroke { gpu, target, base_default: 0.0, channels, replay, tiles: HashSet::new(), label: None, readback: None, device: engine.ctx.device.clone() });
+                d.stroke = Some(DocStroke { gpu, target, base_default: 0.0, channels, replay, tiles: HashSet::new(), label: None, readback: None, taking: None, device: engine.ctx.device.clone() });
                 d.touch();
             }
             StrokeOp::LiquifyField { nodes, data } => {
@@ -164,7 +167,7 @@ pub fn feed(d: &mut DocState, engine: &mut Engine, ops: Vec<StrokeOp>) {
                 d.finish_stroke();
                 let gpu = engine.xform_begin(UploadKey::Content(spec.layer.0), spec.source.clone(), spec.rect, spec.mask.clone());
                 let target = PaintTarget { layer: spec.layer, mask: false, saved: None };
-                d.stroke = Some(DocStroke { gpu, target, base_default: 0.0, channels: 4, replay: Replay::None, tiles: HashSet::new(), label: None, readback: None, device: engine.ctx.device.clone() });
+                d.stroke = Some(DocStroke { gpu, target, base_default: 0.0, channels: 4, replay: Replay::None, tiles: HashSet::new(), label: None, readback: None, taking: None, device: engine.ctx.device.clone() });
                 d.touch();
             }
             StrokeOp::XformQuad(h) => {
@@ -243,7 +246,10 @@ impl DocState {
         #[cfg(not(target_arch = "wasm32"))]
         let px = {
             let _s = prisme_core::perf::span("wait for readback");
-            s.readback.as_ref().and_then(|b| b.wait(&s.device))
+            match &s.taking {
+                Some(t) => t.wait().map(Landed::F16),
+                None => s.readback.as_ref().and_then(|b| b.wait(&s.device)),
+            }
         };
         #[cfg(target_arch = "wasm32")]
         let px = s.readback.as_ref().filter(|b| b.ready(&s.device)).and_then(|b| b.take(&s.device));
@@ -251,11 +257,27 @@ impl DocState {
     }
 
     /// Non-blocking: land the finished stroke if its readback arrived. True while pending.
+    /// On native, f16 tiles are built from the read-back on a worker first (the stroke keeps
+    /// showing meanwhile), so landing doesn't copy the stroke's pixels on the UI thread.
     fn poll_stroke(&mut self) -> bool {
-        let Some(s) = self.stroke.as_ref().filter(|s| s.label.is_some()) else { return false };
+        let Some(s) = self.stroke.as_mut().filter(|s| s.label.is_some()) else { return false };
         let _span = prisme_core::perf::span("poll readback");
         let px = match &s.readback {
             Some(b) if !b.ready(&s.device) => return true,
+            #[cfg(not(target_arch = "wasm32"))]
+            Some(Back::F16(p)) => match &s.taking {
+                None => match p.take_in_background(&s.device) {
+                    Some(t) => {
+                        s.taking = Some(t);
+                        return true;
+                    }
+                    None => None,
+                },
+                Some(t) => match t.try_take() {
+                    None => return true,
+                    Some(tiles) => tiles.map(Landed::F16),
+                },
+            },
             Some(b) => b.take(&s.device),
             None => None,
         };
@@ -342,6 +364,13 @@ impl DocState {
             self.history.push(s.label.clone().unwrap_or_default(), doc);
         }
         self.touch();
+        // A long stroke holds hundreds of tile textures: releasing them takes >10 ms, so
+        // off the UI thread on native (the web has no thread to spare).
+        let freed = (s.gpu, s.replay);
+        #[cfg(not(target_arch = "wasm32"))]
+        std::thread::Builder::new().name("free-stroke".into()).spawn(move || drop(freed)).ok();
+        #[cfg(target_arch = "wasm32")]
+        drop(freed);
     }
 }
 
@@ -507,6 +536,20 @@ mod tests {
         e.adopt_tiles(d.history.current().uid, &p, &ids);
         let px = render(&mut e, d.history.current());
         assert_eq!(e.tile_stats().0, before.0, "landed tiles were uploaded again");
+        assert_eq!(px, render(&mut Engine::new(ctx.clone()), d.history.current()));
+        drop(p);
+        // A second stroke lands through the first one's (pooled) buffers, just as exactly, and
+        // the way frames land it: polled, its tiles built on a worker.
+        drag(&mut d, &mut e, t.as_mut(), &o, [560.0, 60.0], [40.0, 340.0]);
+        let start = std::time::Instant::now();
+        while d.poll_stroke() {
+            assert!(start.elapsed().as_secs() < 10, "stroke never landed");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(d.history.cursor(), 2);
+        let (p, ids) = d.adopt.take().expect("f16 landing");
+        e.adopt_tiles(d.history.current().uid, &p, &ids);
+        let px = render(&mut e, d.history.current());
         assert_eq!(px, render(&mut Engine::new(ctx), d.history.current()));
     }
 
