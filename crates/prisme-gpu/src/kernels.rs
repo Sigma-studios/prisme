@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use wgpu::util::DeviceExt;
 
 // Stroke kernels live in their own file but share the module (bindings and helpers).
-const SOURCE: &str = concat!(include_str!("shaders/kernels.wgsl"), "\n", include_str!("shaders/stroke.wgsl"));
+const SOURCE: &str = concat!(include_str!("shaders/kernels.wgsl"), "\n", include_str!("shaders/stroke.wgsl"), "\n", include_str!("shaders/tiles.wgsl"));
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum OutFormat {
@@ -185,6 +185,7 @@ impl Kernels {
             let (w2lms, lms2lab, lab2lms, lms2w) = prisme_color::oklab_gpu_matrices();
             let src = SOURCE
                 .replace("OUT_FORMAT", fmt.wgsl())
+                .replace("TILE_HALF", &format!("{}u", prisme_core::tile::TILE_SIZE / 2))
                 .replace("MAT_W2LMS", &mat_wgsl(&w2lms))
                 .replace("MAT_LMS2LAB", &mat_wgsl(&lms2lab))
                 .replace("MAT_LAB2LMS", &mat_wgsl(&lab2lms))

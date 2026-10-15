@@ -8,7 +8,7 @@ pub mod display;
 pub mod engine;
 pub mod image;
 pub mod kernels;
-pub mod levels;
+pub mod tiles;
 pub mod readback;
 pub mod scopes;
 pub mod stroke;

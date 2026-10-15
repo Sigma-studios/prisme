@@ -1,0 +1,157 @@
+//! Resident tile store: GPU-built mip levels against the CPU reference `Tile::downsample`,
+//! incremental updates, reuse across views, eviction. Uses any available adapter.
+
+use prisme_core::layer::{Layer, LayerKind, LayerMask};
+use prisme_core::tile::{Tile, TileCoord, TileGrid};
+use prisme_core::{Document, IRect, PixelFormat};
+use prisme_gpu::{Engine, EvalFormat, EvalRequest, GpuContext, Readback, RenderSource};
+use std::sync::Arc;
+
+fn engine() -> Option<Engine> {
+    let ctx = pollster::block_on(GpuContext::headless());
+    if ctx.is_none() {
+        eprintln!("no GPU adapter; skipping");
+    }
+    ctx.map(Engine::new)
+}
+
+fn eval(e: &mut Engine, d: &Document, rect: IRect, mip: u32) -> Vec<f32> {
+    let img = e.evaluate(&EvalRequest { doc: d, rect, mip, format: EvalFormat::F32, source: RenderSource::LayerStack }).unwrap();
+    Readback::start(&e.ctx.device, &e.ctx.queue, &img, rect).wait(&e.ctx.device)
+}
+
+/// CPU mip pyramid level `mip` of `g` (the reference the old CPU path uploaded).
+fn cpu_level(g: &TileGrid, mip: u32) -> TileGrid {
+    let mut cur = g.clone();
+    for _ in 0..mip {
+        let mut next = TileGrid::new(g.format, g.channels);
+        let parents: std::collections::HashSet<TileCoord> = cur.tiles.keys().map(|c| TileCoord::new(c.x.div_euclid(2), c.y.div_euclid(2))).collect();
+        for p in parents {
+            let kids = [(0, 0), (1, 0), (0, 1), (1, 1)].map(|(dx, dy)| cur.get_tile(TileCoord::new(p.x * 2 + dx, p.y * 2 + dy)).map(|t| t.as_ref()));
+            next.tiles.insert(p, Arc::new(Tile::downsample(kids, g.format, g.channels)));
+        }
+        cur = next;
+    }
+    cur
+}
+
+/// A layer with gradients, varying alpha, holes and isolated tiles.
+fn grid() -> TileGrid {
+    let mut g = TileGrid::rgba(PixelFormat::F32);
+    g.map_rect(&IRect::new(-300, -200, 900, 700), |x, y, p| {
+        let a = (((x * 7 + y * 3) & 63) as f32 / 63.0).max(0.05);
+        p.copy_from_slice(&[(x + 300) as f32 / 1200.0, (y + 200) as f32 / 900.0, ((x ^ y) & 31) as f32 / 31.0, a]);
+    });
+    g.map_rect(&IRect::new(2000, 1500, 2100, 1600), |_, _, p| p.copy_from_slice(&[1.0, 0.0, 0.5, 1.0]));
+    g.tiles.remove(&TileCoord::new(1, 1));
+    g
+}
+
+fn doc(g: TileGrid) -> Document {
+    let mut d = Document::infinite("t", 1000, 800, None);
+    let id = d.active_layer.unwrap();
+    d.layer_mut(id).unwrap().kind = LayerKind::Raster(Arc::new(g));
+    d
+}
+
+fn premul(px: &[f32]) -> Vec<f32> {
+    px.chunks(4).flat_map(|p| [p[0] * p[3], p[1] * p[3], p[2] * p[3], p[3]]).collect()
+}
+
+fn max_diff(a: &[f32], b: &[f32]) -> f32 {
+    assert_eq!(a.len(), b.len());
+    a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max)
+}
+
+#[test]
+fn levels_match_cpu_downsample() {
+    let Some(mut e) = engine() else { return };
+    let g = grid();
+    let d = doc(g.clone());
+    for mip in [1, 2, 3, 5] {
+        let k = 1 << mip;
+        let rect = IRect::new(-512 / k, -512 / k, 2560 / k, 2048 / k);
+        let gpu = eval(&mut e, &d, rect, mip);
+        let cpu = premul(&cpu_level(&g, mip).read_rect(&rect));
+        let m = max_diff(&gpu, &cpu);
+        assert!(m < 1e-5, "mip {mip}: max diff {m}");
+    }
+    let (up, built, _) = e.tile_stats();
+    assert_eq!(up as usize, g.tiles.len(), "each tile uploaded once");
+    assert!(built > 0);
+}
+
+#[test]
+fn views_reuse_resident_tiles() {
+    let Some(mut e) = engine() else { return };
+    let d = doc(grid());
+    let views = [(0, IRect::new(-300, -200, 700, 500)), (1, IRect::new(-150, -100, 450, 350)), (2, IRect::new(-75, -50, 225, 175)), (0, IRect::new(-300, -200, 700, 500))];
+    for (mip, r) in views {
+        eval(&mut e, &d, r, mip);
+    }
+    let before = e.tile_stats();
+    // Pan around and zoom back and forth: nothing is uploaded or rebuilt.
+    for (mip, r) in views.iter().rev().chain(views.iter()) {
+        eval(&mut e, &d, r.translate(16 >> mip, 8 >> mip), *mip);
+    }
+    let after = e.tile_stats();
+    assert_eq!((before.0, before.1), (after.0, after.1));
+}
+
+#[test]
+fn edits_update_built_levels() {
+    let Some(mut e) = engine() else { return };
+    let mut g = grid();
+    let rect = IRect::new(-128, -128, 512, 448);
+    let mut d = doc(g.clone());
+    eval(&mut e, &d, rect, 2);
+    let (up0, _, _) = e.tile_stats();
+    // Paint into one tile and erase another entirely.
+    g.map_rect(&IRect::new(10, 10, 60, 60), |_, _, p| p.copy_from_slice(&[0.0, 1.0, 0.0, 1.0]));
+    g.tiles.remove(&TileCoord::new(2, 2));
+    d = doc(g.clone());
+    let gpu = eval(&mut e, &d, rect, 2);
+    let cpu = premul(&cpu_level(&g, 2).read_rect(&rect));
+    assert!(max_diff(&gpu, &cpu) < 1e-5);
+    assert_eq!(e.tile_stats().0, up0 + 1, "only the edited tile is uploaded again");
+}
+
+#[test]
+fn reveal_all_mask_levels_read_missing_tiles_as_visible() {
+    let Some(mut e) = engine() else { return };
+    let mut m = TileGrid::mask();
+    m.map_rect(&IRect::new(0, 0, 256, 256), |_, _, p| p[0] = 0.0);
+    let mut d = Document::infinite("t", 512, 512, None);
+    let id = d.active_layer.unwrap();
+    let mut g = TileGrid::rgba(PixelFormat::F32);
+    g.map_rect(&IRect::new(0, 0, 512, 512), |_, _, p| p.copy_from_slice(&[1.0, 1.0, 1.0, 1.0]));
+    let l: &mut Layer = d.layer_mut(id).unwrap();
+    l.kind = LayerKind::Raster(Arc::new(g));
+    l.mask = Some(LayerMask { grid: Arc::new(m), enabled: true, default_visible: true });
+    // Level 1: the masked tile is the top-left quarter of the only level tile; the other
+    // three quarters have no mask tile and must stay visible.
+    let px = eval(&mut e, &d, IRect::new(0, 0, 256, 256), 1);
+    let a = |x: usize, y: usize| px[(y * 256 + x) * 4 + 3];
+    assert!(a(10, 10) < 1e-6, "hidden: {}", a(10, 10));
+    assert!(a(200, 10) > 0.999 && a(10, 200) > 0.999 && a(200, 200) > 0.999, "{} {} {}", a(200, 10), a(10, 200), a(200, 200));
+}
+
+#[test]
+fn eviction_keeps_results_correct() {
+    let Some(mut e) = engine() else { return };
+    // Room for a couple of pages only: tiles keep getting evicted and coming back.
+    e.set_tile_budget(16 << 20);
+    let g = grid();
+    let d = doc(g.clone());
+    for round in 0..2 {
+        for mip in [0, 1, 2] {
+            let k = 1 << mip;
+            let rect = IRect::new(-512 / k, -512 / k, 2560 / k, 2048 / k);
+            let gpu = eval(&mut e, &d, rect, mip);
+            let cpu = premul(&cpu_level(&g, mip).read_rect(&rect));
+            let m = max_diff(&gpu, &cpu);
+            assert!(m < 1e-5, "round {round} mip {mip}: {m}");
+        }
+    }
+}
+

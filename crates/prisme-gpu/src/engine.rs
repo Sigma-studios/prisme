@@ -9,7 +9,6 @@
 use crate::context::GpuContext;
 use crate::image::{GpuImage, TexturePool};
 use crate::kernels::{Globals, Kernels, OutFormat};
-use crate::levels::MipCache;
 use crate::stroke::GpuStroke;
 use crate::upload::{UploadCache, UploadKey};
 use prisme_core::graph::{Node, ParamValue};
@@ -73,7 +72,6 @@ pub struct Engine {
     pub kernels: Kernels,
     pub(crate) pool: TexturePool,
     uploads: UploadCache,
-    mips: MipCache,
     rasters: HashMap<(LayerId, u32), (u64, Arc<TileGrid>)>,
     results: HashMap<u64, CachedResult>,
     luts: HashMap<u64, Arc<wgpu::Buffer>>,
@@ -127,12 +125,12 @@ impl Engine {
     pub fn new(ctx: GpuContext) -> Self {
         let kernels = Kernels::new(&ctx.device);
         let pool = TexturePool::new(ctx.device.clone());
+        let uploads = UploadCache::new(ctx.device.clone(), ctx.queue.clone());
         Engine {
             ctx,
             kernels,
             pool,
-            uploads: UploadCache::default(),
-            mips: MipCache::default(),
+            uploads,
             rasters: HashMap::new(),
             results: HashMap::new(),
             luts: HashMap::new(),
@@ -148,6 +146,17 @@ impl Engine {
         self.results.clear();
         self.rasters.clear();
         self.luts.clear();
+    }
+
+    /// Resident tiles: (uploaded from the CPU, built on the GPU, VRAM bytes) so far.
+    pub fn tile_stats(&self) -> (u64, u64, u64) {
+        let t = &self.uploads.store;
+        (t.uploads, t.builds, t.bytes())
+    }
+
+    /// VRAM the resident tiles may hold (default 1 GiB).
+    pub fn set_tile_budget(&mut self, bytes: u64) {
+        self.uploads.store.budget = bytes;
     }
 
     pub fn evaluate(&mut self, req: &EvalRequest) -> Option<GpuImage> {
@@ -241,7 +250,6 @@ impl Engine {
         self.last_stats = f.stats;
         self.ctx.queue.submit([f.enc.finish()]);
         self.uploads.end_frame();
-        self.mips.end_frame(4096);
         let fr = self.frame;
         // Recent results, newest first, up to twice this one's size: while zooming every
         // result has a new rect, and holding six full-view images blocks their textures'
@@ -850,7 +858,7 @@ impl Engine {
 
     fn upload(&mut self, f: &mut Frame, key: UploadKey, grid: &TileGrid, rect: IRect, default: f32) -> Option<GpuImage> {
         let f32 = f.format == EvalFormat::F32;
-        let img = self.uploads.get(&self.ctx.device, &self.ctx.queue, &mut self.mips, key, grid, f.mip, rect, f32, default);
+        let img = self.uploads.get(&self.ctx.device, &mut self.pool, &mut self.kernels, &mut f.enc, key, grid, f.mip, rect, f32, default);
         if let Some((base, p)) = f.stroke.and_then(|s| s.xform_args(key, 1 << f.mip)) {
             let mut out = self.new_image(f, rect);
             self.run(f, "k_xform", &out, [img.as_ref(), Some(&base), None, None], &p, None);
@@ -967,8 +975,9 @@ impl Engine {
                 let f32 = f.format == EvalFormat::F32;
                 self.uploads.get(
                     &self.ctx.device,
-                    &self.ctx.queue,
-                    &mut self.mips,
+                    &mut self.pool,
+                    &mut self.kernels,
+                    &mut f.enc,
                     UploadKey::Rasterized(layer.id.0, f.mip),
                     &grid,
                     0,
