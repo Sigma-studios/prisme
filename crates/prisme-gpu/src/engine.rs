@@ -154,6 +154,37 @@ impl Engine {
         (t.uploads, t.builds, t.bytes())
     }
 
+    /// Idle-time work: make the tiles of the visible raster layers (and their masks) over
+    /// `regions` (mip, level rect) resident before a view needs them, so the first pan or
+    /// zoom-out into them doesn't upload or build anything. Stops when `out_of_time`; true
+    /// when there's nothing left to do.
+    pub fn prefetch(&mut self, doc: &Document, regions: &[(u32, IRect)], out_of_time: &dyn Fn() -> bool) -> bool {
+        let mut enc = self.ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("prefetch") });
+        let mut done = true;
+        'all: for &(mip, rect) in regions {
+            for l in doc.all_layers() {
+                if !l.visible {
+                    continue;
+                }
+                if let LayerKind::Raster(g) = &l.kind
+                    && !self.uploads.prefetch(&mut self.kernels, &mut enc, UploadKey::Content(l.id.0), g, mip, rect, false, 0.0, out_of_time)
+                {
+                    done = false;
+                    break 'all;
+                }
+                if let Some(m) = l.mask.as_ref().filter(|m| m.enabled) {
+                    let d = if m.default_visible { 1.0 } else { 0.0 };
+                    if !self.uploads.prefetch(&mut self.kernels, &mut enc, UploadKey::LayerMask(l.id.0), &m.grid, mip, rect, false, d, out_of_time) {
+                        done = false;
+                        break 'all;
+                    }
+                }
+            }
+        }
+        self.ctx.queue.submit([enc.finish()]);
+        done
+    }
+
     /// VRAM the resident tiles may hold (default 1 GiB).
     pub fn set_tile_budget(&mut self, bytes: u64) {
         self.uploads.store.budget = bytes;

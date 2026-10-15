@@ -155,3 +155,33 @@ fn eviction_keeps_results_correct() {
     }
 }
 
+#[test]
+fn prefetched_views_upload_and_build_nothing() {
+    let Some(mut e) = engine() else { return };
+    let d = doc(grid());
+    let regions = [(0, IRect::new(-1024, -1024, 1536, 1280)), (1, IRect::new(-512, -512, 768, 640))];
+    // Sliced: every call does at least one tile, so repeated calls finish.
+    let mut calls = 0;
+    while !e.prefetch(&d, &regions, &|| true) {
+        calls += 1;
+        assert!(calls < 1000);
+    }
+    assert!(calls > 1, "work was spread over several calls");
+    // Views inside them (with their texture margin) at the canvas's precision.
+    let before = e.tile_stats();
+    for (mip, r) in [(0, IRect::new(-256, -256, 512, 512)), (1, IRect::new(-256, -256, 256, 256))] {
+        e.evaluate(&EvalRequest { doc: &d, rect: r, mip, format: EvalFormat::F16, source: RenderSource::LayerStack }).unwrap();
+    }
+    assert_eq!((before.0, before.1), (e.tile_stats().0, e.tile_stats().1));
+}
+
+#[test]
+fn prefetch_stays_under_its_share_of_the_budget() {
+    let Some(mut e) = engine() else { return };
+    e.set_tile_budget(64 << 20);
+    let d = doc(grid());
+    assert!(e.prefetch(&d, &[(0, IRect::new(-4096, -4096, 4096, 4096))], &|| false), "stops (done) when the store is full enough");
+    let (_, _, bytes) = e.tile_stats();
+    // One page past the threshold at most.
+    assert!(bytes <= 64 << 20, "{bytes}");
+}

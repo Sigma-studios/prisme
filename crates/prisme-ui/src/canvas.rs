@@ -396,6 +396,7 @@ fn render(s: &mut AppState, ctx: &egui::Context, rect: Rect, ppp: f32, painter: 
     let pixel_grid = s.settings.pixel_grid;
     let editing_mask = s.settings.tools.edit_saved_mask;
     let active = s.active;
+    let interacting = s.tools.get(&s.tool).is_some_and(|t| t.busy()) || ctx.input(|i| i.pointer.any_down());
     let Some(g) = s.gpu.as_mut() else {
         painter.text(rect.center(), egui::Align2::CENTER_CENTER, "GPU unavailable", egui::FontId::proportional(16.0), theme::WARN);
         return;
@@ -485,6 +486,25 @@ fn render(s: &mut AppState, ctx: &egui::Context, rect: Rect, ppp: f32, painter: 
     }
     if g.scopes.poll(&g.rs.device) {
         ctx.request_repaint();
+    }
+    // Idle frames: make the tiles the next pan (a ring of half the view around it) and
+    // zoom-out (the next level over the same area: twice the view per axis) need resident,
+    // a few ms per frame.
+    if reuse && !interacting && d.stroke.is_none() {
+        let k2 = k * 2;
+        let (cx, cy) = ((visible.x0 + visible.x1) / 2, (visible.y0 + visible.y1) / 2);
+        let (hw, hh) = (visible.width().max(1), visible.height().max(1));
+        let around = |s: i32| IRect::new(cx - hw * s / 2, cy - hh * s / 2, cx + hw * s / 2, cy + hh * s / 2);
+        let clip_doc = |r: IRect| if infinite { r } else { r.intersect(&page) };
+        let at = |r: IRect, k: i32| IRect::new(r.x0.div_euclid(k), r.y0.div_euclid(k), (r.x1 + k - 1).div_euclid(k), (r.y1 + k - 1).div_euclid(k));
+        let mut regions = vec![(mip, at(clip_doc(around(2)), k))];
+        if mip < max_mip.min(10) {
+            regions.push((mip + 1, at(clip_doc(around(2)), k2)));
+        }
+        let deadline = prisme_platform::now_seconds() + 0.003;
+        if !g.engine.prefetch(doc, &regions, &|| prisme_platform::now_seconds() > deadline) {
+            ctx.request_repaint();
+        }
     }
     let Some(image) = d.render.image.clone() else { return };
     let params = DisplayParams {

@@ -68,8 +68,46 @@ impl UploadCache {
         self.pyramids.retain(|_, p| f - p.last_used < 600);
     }
 
-    /// Get a texture with the grid's pixels at `mip` covering at least `need` (level rect),
-    /// clipped to the grid's content. Returns None when the grid has nothing there.
+    /// Make the grid's tiles at `mip` over `rect` (level px) resident ahead of time, recording
+    /// builds into `enc`, until `out_of_time` (checked between tiles; at least one tile is
+    /// done per call). Stops early once the store is three quarters full, so it never evicts
+    /// what views use. True when there's nothing left to do.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prefetch(
+        &mut self,
+        kernels: &mut Kernels,
+        enc: &mut wgpu::CommandEncoder,
+        key: UploadKey,
+        grid: &TileGrid,
+        mip: u32,
+        rect: IRect,
+        f32: bool,
+        default_value: f32,
+        out_of_time: &dyn Fn() -> bool,
+    ) -> bool {
+        let class = Class::of(grid.channels, f32);
+        let pyr = self.pyramids.entry(key).or_default();
+        pyr.last_used = self.frame;
+        pyr.sync(grid, mip);
+        let r = align(rect.intersect(&pyr.bounds(mip)));
+        let pyr = &self.pyramids[&key];
+        let mut worked = false;
+        for c in TileGrid::coords_in(&r) {
+            if pyr.key(mip, c) == 0 || self.store.resident(class, pyr, mip, c, default_value) {
+                continue;
+            }
+            if self.store.bytes() > self.store.budget / 4 * 3 || (worked && out_of_time()) {
+                return self.store.bytes() > self.store.budget / 4 * 3;
+            }
+            self.store.get(kernels, enc, class, grid, pyr, mip, c, default_value);
+            worked = true;
+        }
+        true
+    }
+
+    /// Get a texture with the grid's pixels at `mip` over `need` (level rect), clipped to the
+    /// grid's content; outside `need` it may hold stale or default pixels. Returns None when
+    /// the grid has nothing there.
     /// Tile copies (and builds of missing levels) are recorded into `enc`.
     #[allow(clippy::too_many_arguments)]
     pub fn get(
@@ -132,7 +170,9 @@ impl UploadCache {
         let e = self.entries.get_mut(&key).unwrap();
         e.last_used = self.frame;
         let rect = e.image.rect;
-        for c in TileGrid::coords_in(&rect) {
+        // Only the requested tiles: the margin keeps the default fill until a later request
+        // reaches it (its tiles are recorded as default, so they're fetched then).
+        for c in TileGrid::coords_in(&want) {
             let id = pyr.key(mip, c);
             if e.tiles.get(&c) == Some(&id) {
                 continue;

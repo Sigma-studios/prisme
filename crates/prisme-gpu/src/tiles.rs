@@ -332,6 +332,12 @@ impl TileStore {
         Some(slot)
     }
 
+    /// Tile `c` at `mip` is resident (marks it used).
+    pub fn resident(&mut self, class: Class, pyr: &Pyramid, mip: u32, c: TileCoord, default: f32) -> bool {
+        let id = pyr.key(mip, c);
+        self.touch(&(class, mip, id, if mip == 0 { 0 } else { default.to_bits() })).is_some()
+    }
+
     /// A tile filled with `value` (missing tiles of masks that reveal by default).
     pub fn constant(&mut self, class: Class, value: f32) -> Slot {
         if let Some(s) = self.constants.get(&(class, value.to_bits())) {
