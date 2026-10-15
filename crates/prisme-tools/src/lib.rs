@@ -19,7 +19,7 @@ pub mod transform;
 pub use liquify::{LiquifyMode, LiquifyOptions, LiquifySpec};
 pub use input::{Modifiers, Phase, PointerKind, ToolInput, ToolKey};
 pub use options::ToolOptions;
-pub use stroke::{PaintTarget, StrokeOp, StrokeSpec};
+pub use stroke::{PaintTarget, StrokeOp, StrokeSpec, XformSpec};
 pub use tools::{make_tool, Overlay, Tool, ToolCursor, ToolCx, ToolKind, ToolOutcome};
 
 /// Parallel-for over a mutable slice on native, sequential on wasm.

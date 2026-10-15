@@ -404,3 +404,68 @@ fn k_liquify(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     textureStore(out_tex, out_coord(gid), o);
 }
+
+// ---- Free Transform preview: a snapshot drawn through a projective map (backward: output
+// p samples the source at H⁻¹(p)), bilinear like prisme_tools::transform::warp.
+// in0 = regular upload at this level (what stays behind), in1 = source (level 0, straight;
+// a single-channel mask in mask mode). P0 = [2^mip, mask mode, default, 0],
+// P1..P3 = H⁻¹ row-major (document -> source px), P4 = transformed bounds (document px).
+// Content mode draws the source over in0; mask mode replaces the mask, `default` outside.
+
+fn xf_px(q: vec2<i32>, mask: bool) -> vec4<f32> {
+    let r = q - info.in1.xy;
+    if (!inside(r, info.in1.zw)) { return vec4<f32>(select(0.0, pf(2u), mask)); }
+    let v = textureLoad(in1, r, 0);
+    if (mask) { return vec4<f32>(v.r); }
+    return vec4<f32>(v.rgb * v.a, v.a);
+}
+
+// Premultiplied source value (mask: value in every channel) at document position c.
+fn xf_sample(c: vec2<f32>, mask: bool) -> vec4<f32> {
+    let a = pv(1u);
+    let b = pv(2u);
+    let w = b.z * c.x + b.w * c.y + pf(12u);
+    let s = vec2<f32>(a.x * c.x + a.y * c.y + a.z, a.w * c.x + b.x * c.y + b.y) / w;
+    if (abs(w) < 1e-12 || abs(s.x) > 1e8 || abs(s.y) > 1e8) { return vec4<f32>(select(0.0, pf(2u), mask)); }
+    let f = s - 0.5;
+    let fl = floor(f);
+    let t = f - fl;
+    let i = vec2<i32>(fl);
+    let n0 = xf_px(i, mask);
+    let n1 = xf_px(i + vec2<i32>(1, 0), mask);
+    let n2 = xf_px(i + vec2<i32>(0, 1), mask);
+    let n3 = xf_px(i + vec2<i32>(1, 1), mask);
+    return mix(mix(n0, n1, t.x), mix(n2, n3, t.x), t.y);
+}
+
+@compute @workgroup_size(8, 8)
+fn k_xform(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (!in_bounds(gid)) { return; }
+    let p = gpos(gid);
+    let k = pf(0u);
+    let mask = pf(1u) > 0.5;
+    let bd = pv(4u);
+    let lo = vec2<f32>(p) * k;
+    let hi = lo + k;
+    let hit = hi.x > bd.x && hi.y > bd.y && lo.x < bd.z && lo.y < bd.w;
+    var v = vec4<f32>(select(0.0, pf(2u), mask));
+    if (hit) {
+        if (k < 1.5) {
+            v = xf_sample(lo + 0.5 * k, mask);
+        } else {
+            // 2x2 samples over the level pixel's footprint.
+            v = (xf_sample(lo + vec2<f32>(0.25, 0.25) * k, mask) + xf_sample(lo + vec2<f32>(0.75, 0.25) * k, mask)
+                + xf_sample(lo + vec2<f32>(0.25, 0.75) * k, mask) + xf_sample(lo + vec2<f32>(0.75, 0.75) * k, mask)) * 0.25;
+        }
+    }
+    if (mask) {
+        textureStore(out_tex, out_coord(gid), vec4<f32>(v.r));
+        return;
+    }
+    var o = vec4<f32>(0.0);
+    let q = p - info.in0.xy;
+    if (info.connected.x != 0u && inside(q, info.in0.zw)) { o = textureLoad(in0, q, 0); }
+    let r = v + vec4<f32>(o.rgb * o.a, o.a) * (1.0 - v.a);
+    if (r.a > 1e-6) { o = vec4<f32>(r.rgb / r.a, min(r.a, 1.0)); } else { o = vec4<f32>(0.0); }
+    textureStore(out_tex, out_coord(gid), o);
+}

@@ -27,6 +27,12 @@
 //! lives in a node texture updated in place, and there is no `live` texture: evaluation warps
 //! `base` through the field directly at the requested level (`k_liquify`), and the bake
 //! renders it bicubic at full resolution for the readback.
+//!
+//! A Free Transform preview is one too ([`Engine::xform_begin`]): a dense snapshot of the
+//! pixels being transformed (and of the layer mask when it moves with them), drawn through
+//! the current homography over the layer's regular upload (`k_xform`). Moving a handle only
+//! changes the map, so nothing is resampled on the CPU or re-uploaded per frame. It has no
+//! readback: the tool resamples the layer on the CPU once when the transform is applied.
 
 use crate::engine::Engine;
 use crate::image::{GpuImage, PooledTex, TexturePool};
@@ -35,6 +41,7 @@ use crate::readback::Readback;
 use crate::upload::UploadKey;
 use prisme_brush::{BlendTarget, Dab, RetouchMode, StrokeMode, TipShape};
 use prisme_core::tile::{TileCoord, TileGrid, TILE_PIXELS, TILE_SIZE};
+use prisme_core::geom::Homography;
 use prisme_core::IRect;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -188,10 +195,10 @@ impl Source {
 }
 
 /// A grid's pixels at f32 over one dense tile-aligned rect (Liquify's working area).
-fn snapshot(device: &wgpu::Device, queue: &wgpu::Queue, grid: &TileGrid, rect: IRect) -> GpuImage {
+fn snapshot(device: &wgpu::Device, queue: &wgpu::Queue, grid: &TileGrid, rect: IRect, default: f32) -> GpuImage {
     let img = texture(device, rect, format_for(grid.channels));
     for c in TileGrid::coords_in(&rect) {
-        upload_tile(queue, &img, [(c.x * TS - rect.x0) as u32, (c.y * TS - rect.y0) as u32], grid, 0.0, c);
+        upload_tile(queue, &img, [(c.x * TS - rect.x0) as u32, (c.y * TS - rect.y0) as u32], grid, default, c);
     }
     img
 }
@@ -250,6 +257,7 @@ impl Brush {
 enum Kind {
     Brush(Brush),
     Liquify(Liquify),
+    Xform(Xform),
 }
 
 /// GPU state of one brush stroke (see the module docs).
@@ -276,7 +284,7 @@ impl GpuStroke {
     pub fn tile_bytes(&self) -> u64 {
         match &self.kind {
             Kind::Brush(b) => b.bytes(),
-            Kind::Liquify(_) => 0,
+            Kind::Liquify(_) | Kind::Xform(_) => 0,
         }
     }
 
@@ -284,7 +292,7 @@ impl GpuStroke {
     pub(crate) fn live_tiles(&self) -> impl Iterator<Item = (TileCoord, &GpuImage)> {
         let tiles = match &self.kind {
             Kind::Brush(b) => Some(b.live.tiles.iter().map(|(c, t)| (*c, t))),
-            Kind::Liquify(_) => None,
+            Kind::Liquify(_) | Kind::Xform(_) => None,
         };
         tiles.into_iter().flatten()
     }
@@ -520,7 +528,7 @@ impl GpuStroke {
     pub fn liquify_rect(&self) -> IRect {
         match &self.kind {
             Kind::Liquify(l) => l.rect,
-            Kind::Brush(_) => IRect::EMPTY,
+            Kind::Brush(_) | Kind::Xform(_) => IRect::EMPTY,
         }
     }
 }
@@ -540,7 +548,7 @@ impl Engine {
             log::warn!("liquify area {want:?} exceeds GPU limits; no GPU preview");
             (None, None)
         } else {
-            (Some(snapshot(&device, &queue, &base, want)), selection.map(|s| snapshot(&device, &queue, &s, want)))
+            (Some(snapshot(&device, &queue, &base, want, 0.0)), selection.map(|s| snapshot(&device, &queue, &s, want, 0.0)))
         };
         let liquify = Liquify { field, rect, step, show_mask: false, base, sel };
         GpuStroke { key, kind: Kind::Liquify(liquify), channels, dirty: IRect::EMPTY, generation: 0, overflow }
@@ -593,4 +601,86 @@ impl Engine {
         self.ctx.queue.submit([enc.finish()]);
         Some(Readback::start(&self.ctx.device, &self.ctx.queue, &out, rect))
     }
+}
+
+/// Free Transform preview state (see the module docs).
+struct Xform {
+    /// Pixels being transformed, and the moving layer mask with its missing-tile value
+    /// (level 0, straight; None on overflow).
+    base: Option<GpuImage>,
+    mask: Option<(GpuImage, f32)>,
+    /// Document px -> source px.
+    inv: [f32; 9],
+    /// Source rect, and its transformed bounds (document px).
+    rect: IRect,
+    bounds: IRect,
+}
+
+impl GpuStroke {
+    pub fn is_xform(&self) -> bool {
+        matches!(self.kind, Kind::Xform(_))
+    }
+
+    /// `k_xform` source and params when `key` is one of the preview's uploads (the layer's
+    /// pixels or its moving mask), at level scale `k`.
+    pub(crate) fn xform_args(&self, key: UploadKey, k: i32) -> Option<(GpuImage, Vec<f32>)> {
+        let Kind::Xform(x) = &self.kind else { return None };
+        let UploadKey::Content(id) = self.key else { return None };
+        let (img, mask, default) = match key {
+            _ if key == self.key => (x.base.clone()?, false, 0.0),
+            UploadKey::LayerMask(m) if m == id => {
+                let (img, d) = x.mask.clone()?;
+                (img, true, d)
+            }
+            _ => return None,
+        };
+        let (m, b) = (x.inv, x.bounds);
+        let p = vec![k as f32, mask as i32 as f32, default, 0.0, m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], 0.0, 0.0, 0.0, b.x0 as f32, b.y0 as f32, b.x1 as f32, b.y1 as f32];
+        Some((img, p))
+    }
+}
+
+impl Engine {
+    /// Start a Free Transform preview of `source` (layer `key`'s pixels over `rect`), with the
+    /// layer mask when it moves along.
+    pub fn xform_begin(&mut self, key: UploadKey, source: Arc<TileGrid>, rect: IRect, mask: Option<(Arc<TileGrid>, f32)>) -> GpuStroke {
+        let (device, queue) = (self.ctx.device.clone(), self.ctx.queue.clone());
+        let want = align(rect);
+        let max = device.limits().max_texture_dimension_2d as i32;
+        let bytes = want.area() as u64 * (bytes_per_px(format_for(source.channels)) + if mask.is_some() { 4 } else { 0 });
+        let overflow = want.width() > max || want.height() > max || bytes > BUDGET;
+        let (base, mask) = if overflow {
+            log::warn!("transform source {want:?} exceeds GPU limits; no GPU preview");
+            (None, None)
+        } else {
+            (Some(snapshot(&device, &queue, &source, want, 0.0)), mask.map(|(m, d)| (snapshot(&device, &queue, &m, want, d), d)))
+        };
+        let xform = Xform { base, mask, inv: Homography::IDENTITY.m, rect, bounds: rect };
+        GpuStroke { key, kind: Kind::Xform(xform), channels: source.channels, dirty: IRect::EMPTY, generation: 0, overflow }
+    }
+
+    /// Move the preview: `h` maps source px to document px.
+    pub fn xform_update(&mut self, s: &mut GpuStroke, h: &Homography) {
+        let Kind::Xform(x) = &mut s.kind else { return };
+        let Some(inv) = h.inverse() else { return };
+        let r = x.rect;
+        let q = [[r.x0, r.y0], [r.x1, r.y0], [r.x1, r.y1], [r.x0, r.y1]].map(|p| h.apply([p[0] as f32, p[1] as f32]));
+        if q.iter().any(|p| !p[0].is_finite() || !p[1].is_finite()) {
+            return;
+        }
+        x.inv = inv.m;
+        x.bounds = quad_bounds(&q).expand(1);
+        s.generation += 1;
+    }
+}
+
+fn quad_bounds(q: &[[f32; 2]; 4]) -> IRect {
+    let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for p in q {
+        x0 = x0.min(p[0]);
+        y0 = y0.min(p[1]);
+        x1 = x1.max(p[0]);
+        y1 = y1.max(p[1]);
+    }
+    IRect::from_f32(x0, y0, x1, y1)
 }

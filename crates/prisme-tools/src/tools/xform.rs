@@ -1,5 +1,6 @@
 use super::*;
 use crate::input::Phase;
+use crate::stroke::{StrokeOp, XformSpec};
 use crate::transform::{merge_over, quad_bounds, split_by_selection, translate, warp, Resample};
 use prisme_core::geom::{Affine2, Homography};
 use prisme_core::layer::{FillContent, Layer, LayerKind};
@@ -176,7 +177,13 @@ struct XformSession {
     rect: [f32; 4],
     quad: [[f32; 2]; 4],
     drag: Option<(Handle, [f32; 2], [[f32; 2]; 4])>,
+    /// The GPU host draws the preview (raster layers): the working copy holds `rest` and no
+    /// selection until Enter warps the pixels on the CPU.
+    gpu: bool,
 }
+
+/// Largest source the GPU preview snapshots (WebGPU's guaranteed texture size).
+const GPU_PREVIEW_MAX: i32 = 8192;
 
 /// Free transform: scale (corners/edges, Shift = keep aspect), rotate (outside the box,
 /// Shift = 15° steps), distort/perspective (Cmd/Ctrl + corner), move (inside).
@@ -202,6 +209,12 @@ fn rect_of(l: &Layer, doc: &Document) -> Option<[f32; 4]> {
     (!b.is_empty()).then_some([b.x0 as f32, b.y0 as f32, b.x1 as f32, b.y1 as f32])
 }
 
+/// The layer mask moving with the pixels (whole-layer transforms) and its missing-tile value.
+fn moving_mask(l: &Layer, whole: bool) -> Option<(Arc<TileGrid>, f32)> {
+    let m = l.mask.as_ref().filter(|_| whole)?;
+    Some((m.grid.clone(), if m.default_visible { 1.0 } else { 0.0 }))
+}
+
 impl TransformTool {
     fn ensure(&mut self, cx: &mut ToolCx) -> bool {
         if self.session.is_some() {
@@ -221,6 +234,19 @@ impl TransformTool {
             _ => (Arc::new(TileGrid::default()), None),
         };
         let quad = [[rect[0], rect[1]], [rect[2], rect[1]], [rect[2], rect[3]], [rect[0], rect[3]]];
+        let src_rect = IRect::from_f32(rect[0], rect[1], rect[2], rect[3]);
+        let gpu = cx.strokes.is_some() && layer.raster().is_some() && src_rect.width() <= GPU_PREVIEW_MAX && src_rect.height() <= GPU_PREVIEW_MAX;
+        if gpu {
+            let mask = moving_mask(&layer, rest.is_none());
+            if let Some(ops) = cx.strokes.as_mut() {
+                ops.push(StrokeOp::XformBegin(XformSpec { layer: layer.id, source: source.clone(), rect: src_rect, mask }));
+            }
+            let empty = || TileGrid::new(source.format, source.channels);
+            if let Some(l) = cx.doc.layer_mut(layer.id) {
+                l.kind = LayerKind::Raster(Arc::new(rest.clone().unwrap_or_else(empty)));
+            }
+            cx.doc.selection = None;
+        }
         self.session = Some(XformSession {
             layer: layer.id,
             original: layer,
@@ -230,13 +256,22 @@ impl TransformTool {
             rect,
             quad,
             drag: None,
+            gpu,
         });
         true
     }
 
-    fn render(&self, cx: &mut ToolCx, mode: Resample) {
+    /// Show the current quad: a homography for the GPU preview, or the layer resampled on the
+    /// CPU (always when `bake`).
+    fn render(&self, cx: &mut ToolCx, mode: Resample, bake: bool) {
         let Some(s) = &self.session else { return };
         let h = Homography::rect_to_quad(s.rect, s.quad);
+        if s.gpu && !bake {
+            if let Some(ops) = cx.strokes.as_mut() {
+                ops.push(StrokeOp::XformQuad(h));
+            }
+            return;
+        }
         let Some(l) = cx.doc.layer_mut(s.layer) else { return };
         match &s.original.kind {
             LayerKind::Raster(_) => {
@@ -282,6 +317,13 @@ impl TransformTool {
             }
             _ => {}
         }
+    }
+
+    fn abort_preview(&self, cx: &mut ToolCx) {
+        if self.session.as_ref().is_some_and(|s| s.gpu)
+            && let Some(ops) = cx.strokes.as_mut() {
+                ops.push(StrokeOp::Abort);
+            }
     }
 
     fn hit(&self, p: [f32; 2], tol: f32) -> Option<Handle> {
@@ -403,14 +445,16 @@ impl Tool for TransformTool {
                     }
                 }
                 s.quad = q;
-                self.render(cx, Resample::Nearest);
+                self.render(cx, Resample::Nearest, false);
                 ToolOutcome::Preview
             }
             Phase::Up => {
                 if let Some(s) = self.session.as_mut() {
                     s.drag = None;
                 }
-                self.render(cx, Resample::Bilinear);
+                if !self.session.as_ref().is_some_and(|s| s.gpu) {
+                    self.render(cx, Resample::Bilinear, false);
+                }
                 ToolOutcome::Preview
             }
             Phase::Hover => ToolOutcome::Preview,
@@ -420,11 +464,13 @@ impl Tool for TransformTool {
     fn key(&mut self, cx: &mut ToolCx, key: &ToolKey) -> ToolOutcome {
         match key {
             ToolKey::Enter if self.session.is_some() => {
-                self.render(cx, Resample::Bicubic);
+                self.render(cx, Resample::Bicubic, true);
+                self.abort_preview(cx);
                 self.session = None;
                 ToolOutcome::Commit("Free Transform".into())
             }
             ToolKey::Escape if self.session.is_some() => {
+                self.abort_preview(cx);
                 self.session = None;
                 ToolOutcome::Cancel
             }

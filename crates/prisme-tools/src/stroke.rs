@@ -10,6 +10,7 @@ use crate::liquify::{LiquifyField, LiquifySpec};
 use crate::paint::RetouchCanvas;
 use prisme_brush::{Dab, StrokeCanvas, StrokeMode};
 use prisme_core::tile::{Tile, TileCoord, TileGrid, TILE_SIZE};
+use prisme_core::geom::Homography;
 use prisme_core::{Document, IRect, LayerId, MaskId};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -43,6 +44,18 @@ pub struct StrokeSpec {
     pub mode: StrokeMode,
 }
 
+/// Free Transform preview state: the pixels being transformed and, when the layer mask moves
+/// with them, its grid and missing-tile value. While the preview is up the working copy holds
+/// what stays behind (the unselected remainder, or nothing).
+#[derive(Clone, Debug)]
+pub struct XformSpec {
+    pub layer: LayerId,
+    pub source: Arc<TileGrid>,
+    /// Bounds of `source` being transformed (document px).
+    pub rect: IRect,
+    pub mask: Option<(Arc<TileGrid>, f32)>,
+}
+
 #[derive(Clone, Debug)]
 pub enum StrokeOp {
     Begin(StrokeSpec),
@@ -56,6 +69,10 @@ pub enum StrokeOp {
     LiquifyField { nodes: IRect, data: Vec<[f32; 4]> },
     /// Bake the session: land the warped target as one history edit with this label.
     LiquifyEnd { label: String, field: Arc<LiquifyField> },
+    /// Start a Free Transform preview: `source` drawn through a homography over the layer.
+    XformBegin(XformSpec),
+    /// The transform changed: `h` maps source px to document px.
+    XformQuad(Homography),
     /// Discard the in-progress stroke / session.
     Abort,
 }

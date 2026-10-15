@@ -13,6 +13,9 @@
 //! A Liquify session is a long-lived stroke of the same kind: the tool streams field updates
 //! while it's open, and its bake (a bicubic GPU render of the changed area) lands the same
 //! way; the CPU fallback re-warps with `prisme_tools::liquify::apply_cpu`.
+//!
+//! A Free Transform preview is a stroke that never lands: it lives while the tool's session
+//! is open, and applying it resamples the layer on the CPU in the tool.
 
 use crate::app::AppState;
 use crate::doc::DocState;
@@ -32,6 +35,8 @@ enum Replay {
     Dabs(StrokeSpec, Vec<Dab>),
     /// The final field (set by `LiquifyEnd`).
     Liquify(LiquifySpec, Option<Arc<LiquifyField>>),
+    /// A preview that never lands (Free Transform applies itself on the CPU).
+    None,
 }
 
 pub struct DocStroke {
@@ -105,6 +110,19 @@ pub fn feed(d: &mut DocState, engine: &mut Engine, ops: Vec<StrokeOp>) {
                         *f = Some(field);
                     }
                     s.label = Some(label);
+                }
+            }
+            StrokeOp::XformBegin(spec) => {
+                d.finish_stroke();
+                let gpu = engine.xform_begin(UploadKey::Content(spec.layer.0), spec.source.clone(), spec.rect, spec.mask.clone());
+                let target = PaintTarget { layer: spec.layer, mask: false, saved: None };
+                d.stroke = Some(DocStroke { gpu, target, base_default: 0.0, channels: 4, replay: Replay::None, tiles: HashSet::new(), label: None, readback: None, device: engine.ctx.device.clone() });
+                d.touch();
+            }
+            StrokeOp::XformQuad(h) => {
+                if let Some(s) = d.stroke.as_mut().filter(|s| s.label.is_none() && s.gpu.is_xform()) {
+                    engine.xform_update(&mut s.gpu, &h);
+                    d.touch();
                 }
             }
             StrokeOp::Abort => {
@@ -214,7 +232,7 @@ impl DocState {
                 match &s.replay {
                     Replay::Dabs(spec, dabs) => replay_stroke(doc, spec, dabs),
                     Replay::Liquify(spec, Some(field)) => apply_cpu(doc, spec, field),
-                    Replay::Liquify(_, None) => {}
+                    Replay::Liquify(_, None) | Replay::None => {}
                 }
             }
         };
@@ -246,6 +264,9 @@ mod tests {
             }
         };
         feed(d, e, ops);
+        if let ToolOutcome::Commit(label) = &out {
+            d.commit_working(label);
+        }
         if !t.busy() {
             d.working = None;
         }
@@ -308,5 +329,34 @@ mod tests {
         assert_eq!(input(&mut d, &mut e, t.as_mut(), &o, Err(ToolKey::Escape)), ToolOutcome::Cancel);
         assert!(d.stroke.is_none() && d.history.cursor() == 0);
         assert_eq!(layer(d.doc()), before);
+    }
+
+    #[test]
+    fn transform_previews_on_the_gpu_and_applies_once() {
+        let Some(ctx) = pollster::block_on(prisme_gpu::GpuContext::headless()) else { return eprintln!("no GPU adapter; skipping") };
+        let mut e = Engine::new(ctx);
+        let mut doc = Document::with_background("t", 200, 200, None);
+        let id = doc.active_layer.unwrap();
+        let g = doc.layer_mut(id).unwrap().raster_mut().unwrap();
+        g.map_rect(&IRect::new(40, 40, 80, 80), |_, _, p| p.copy_from_slice(&[1.0, 0.0, 0.0, 1.0]));
+        let mut d = DocState::new(doc);
+        let o = ToolOptions::default();
+        let mut t = make_tool(ToolKind::Transform);
+        // Drag the box 50 px right: the preview is a GPU stroke, the working layer is emptied.
+        drag(&mut d, &mut e, t.as_mut(), &o, [60.0, 60.0], [110.0, 60.0]);
+        assert!(t.busy() && d.stroke.as_ref().is_some_and(|s| s.gpu.is_xform() && s.gpu.generation > 0));
+        assert!(d.working.as_ref().unwrap().active().unwrap().raster().unwrap().tiles.is_empty());
+        assert_eq!(d.history.cursor(), 0);
+        // Enter resamples once and commits; the preview goes away.
+        assert_eq!(input(&mut d, &mut e, t.as_mut(), &o, Err(ToolKey::Enter)), ToolOutcome::Commit("Free Transform".into()));
+        assert_eq!(d.history.cursor(), 1);
+        assert!(d.stroke.is_none() && !t.busy());
+        let g = d.history.current().active().unwrap().raster().unwrap().clone();
+        assert!(g.get_pixel(110, 60)[3] > 0.99 && g.get_pixel(60, 60)[3] < 0.01, "moved: {:?} {:?}", g.get_pixel(110, 60), g.get_pixel(60, 60));
+        // Escape restores the layer.
+        drag(&mut d, &mut e, t.as_mut(), &o, [110.0, 60.0], [150.0, 100.0]);
+        assert_eq!(input(&mut d, &mut e, t.as_mut(), &o, Err(ToolKey::Escape)), ToolOutcome::Cancel);
+        assert!(d.stroke.is_none());
+        assert_eq!(d.doc().active().unwrap().raster().unwrap().read_rect(&IRect::new(0, 0, 200, 200)), g.read_rect(&IRect::new(0, 0, 200, 200)));
     }
 }
