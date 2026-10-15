@@ -511,6 +511,16 @@ pub fn ui(s: &mut AppState, ui: &mut Ui) {
         if refreshed {
             ui.ctx().request_repaint();
         }
+        // Thumbnails of deleted nodes (the navigator's, keyed by the output node, stays).
+        let gone: Vec<_> = g.thumbs.keys().filter(|k| k.0 == doc_id && !doc.graph.nodes.contains_key(&k.1)).copied().collect();
+        if !gone.is_empty() {
+            let mut r = g.rs.renderer.write();
+            for k in gone {
+                if let Some((_, t, _)) = g.thumbs.remove(&k) {
+                    r.free_texture(&t);
+                }
+            }
+        }
     }
 
     let ed = s.node_editors.entry(doc_id).or_default();

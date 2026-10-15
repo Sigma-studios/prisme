@@ -10,7 +10,8 @@
 //! `save:PATH` (.prisme) · `undo` · `redo` · `toggle-nodes` · `hdr:auto|on|off` (persisted setting) ·
 //! `hdr-status` (log surface format / colour space / headroom) · `liquify-mode:forward|bloat|pucker|twirl-cw|…`
 //! (`LiquifyMode::id`) · `hold:x,y,SECONDS` (press and hold still, ticking the tool at 30 Hz: stationary
-//! liquify modes, airbrush) · `quit`.
+//! liquify modes, airbrush) · `sleep:SECONDS` (block the UI thread: wall-clock pauses, e.g. to sample
+//! memory while background work finishes) · `quit`.
 
 use crate::app::AppState;
 use prisme_tools::{Phase, ToolInput, ToolKey, ToolKind};
@@ -34,6 +35,7 @@ impl Script {
         None
     }
 }
+
 
 fn nums(s: &str) -> Vec<f32> {
     s.split(',').filter_map(|v| v.trim().parse().ok()).collect()
@@ -258,6 +260,10 @@ pub fn step(s: &mut AppState, sc: &mut Script, ctx: &egui::Context) {
             }
         }
         "wait" => sc.wait = arg.parse().unwrap_or(10),
+        "sleep" => {
+            #[cfg(not(target_arch = "wasm32"))]
+            std::thread::sleep(std::time::Duration::from_secs_f64(arg.parse().unwrap_or(1.0)));
+        }
         "shot" => {
             sc.pending_shot = Some(arg.to_string());
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));

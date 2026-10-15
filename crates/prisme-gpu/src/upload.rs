@@ -6,18 +6,24 @@
 //! a texture that has to grow or change level is refilled the same way, so views never
 //! re-send pixels from the CPU and never downsample there. The textures themselves come from
 //! the engine's pool, so changing level or growing doesn't allocate either.
+//!
+//! Everything here is keyed by document as well: layer and mask ids restart in every document,
+//! and [`UploadCache::release`] drops a closed document's textures and tiles.
 
 use crate::image::{GpuImage, TexturePool};
 use crate::kernels::Globals;
 use crate::kernels::Kernels;
 use crate::tiles::{Class, Pyramid, TileStore};
 use prisme_core::tile::{TileCoord, TileGrid, TILE_SIZE};
-use prisme_core::IRect;
+use prisme_core::{DocUid, IRect};
 use std::collections::HashMap;
 
 const TS: i32 = TILE_SIZE as i32;
 /// VRAM the resident tiles may hold before the least recently used are evicted.
 const STORE_BUDGET: u64 = 1 << 30;
+/// Tiles no view used for this many evaluations are dropped, checked every `TRIM_EVERY`.
+const TILE_MAX_AGE: u64 = 2048;
+const TRIM_EVERY: u64 = 256;
 const G: Globals = Globals { level_scale: 1.0, mip: 0, doc_w: 0.0, doc_h: 0.0, infinite: false };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -39,9 +45,11 @@ struct Entry {
     last_used: u64,
 }
 
+type Key = (DocUid, UploadKey);
+
 pub struct UploadCache {
-    entries: HashMap<UploadKey, Entry>,
-    pyramids: HashMap<UploadKey, Pyramid>,
+    entries: HashMap<Key, Entry>,
+    pyramids: HashMap<Key, Pyramid>,
     pub store: TileStore,
     frame: u64,
 }
@@ -61,11 +69,24 @@ impl UploadCache {
     }
 
     /// Evict textures unused for several evaluations (thumbnails and the canvas interleave),
-    /// and the tile keys of grids not shown for a while.
+    /// the tile keys of grids not shown for a while, and now and then the tiles nothing has
+    /// shown for a long while (deleted layers, areas long left), compacting when that frees
+    /// most of the pages. Called after the evaluation's commands are submitted.
     pub fn end_frame(&mut self) {
         let f = self.frame;
         self.entries.retain(|_, e| f - e.last_used < 6);
         self.pyramids.retain(|_, p| f - p.last_used < 600);
+        if f.is_multiple_of(TRIM_EVERY) {
+            self.store.trim(TILE_MAX_AGE);
+        }
+    }
+
+    /// Drop everything held for `doc` (a closed document) and give the memory back.
+    pub fn release(&mut self, doc: DocUid) {
+        self.entries.retain(|k, _| k.0 != doc);
+        self.pyramids.retain(|k, _| k.0 != doc);
+        self.store.release(doc);
+        self.store.compact();
     }
 
     /// Make the grid's tiles at `mip` over `rect` (level px) resident ahead of time, recording
@@ -77,6 +98,7 @@ impl UploadCache {
         &mut self,
         kernels: &mut Kernels,
         enc: &mut wgpu::CommandEncoder,
+        doc: DocUid,
         key: UploadKey,
         grid: &TileGrid,
         mip: u32,
@@ -86,6 +108,7 @@ impl UploadCache {
         out_of_time: &dyn Fn() -> bool,
     ) -> bool {
         let class = Class::of(grid.channels, f32);
+        let key = (doc, key);
         let pyr = self.pyramids.entry(key).or_default();
         pyr.last_used = self.frame;
         pyr.sync(grid, mip);
@@ -93,21 +116,21 @@ impl UploadCache {
         let pyr = &self.pyramids[&key];
         let mut worked = false;
         for c in TileGrid::coords_in(&r) {
-            if pyr.key(mip, c) == 0 || self.store.resident(class, pyr, mip, c, default_value) {
+            if pyr.key(mip, c) == 0 || self.store.resident(doc, class, pyr, mip, c, default_value) {
                 continue;
             }
             if self.store.bytes() > self.store.budget / 4 * 3 || (worked && out_of_time()) {
                 return self.store.bytes() > self.store.budget / 4 * 3;
             }
-            self.store.get(kernels, enc, class, grid, pyr, mip, c, default_value);
+            self.store.get(kernels, enc, doc, class, grid, pyr, mip, c, default_value);
             worked = true;
         }
         true
     }
 
-    /// Get a texture with the grid's pixels at `mip` over `need` (level rect), clipped to the
-    /// grid's content; outside `need` it may hold stale or default pixels. Returns None when
-    /// the grid has nothing there.
+    /// Get a texture with the grid's pixels at `mip` over `need` (level rect): exact
+    /// everywhere in `need` it covers (outside its rect, the grid has nothing). Beyond `need`
+    /// it may hold stale pixels. Returns None when the grid has nothing in `need`.
     /// Tile copies (and builds of missing levels) are recorded into `enc`.
     #[allow(clippy::too_many_arguments)]
     pub fn get(
@@ -116,6 +139,7 @@ impl UploadCache {
         pool: &mut TexturePool,
         kernels: &mut Kernels,
         enc: &mut wgpu::CommandEncoder,
+        doc: DocUid,
         key: UploadKey,
         grid: &TileGrid,
         mip: u32,
@@ -124,6 +148,7 @@ impl UploadCache {
         default_value: f32,
     ) -> Option<GpuImage> {
         let class = Class::of(grid.channels, f32);
+        let key = (doc, key);
         let pyr = self.pyramids.entry(key).or_default();
         pyr.last_used = self.frame;
         pyr.sync(grid, mip);
@@ -170,14 +195,15 @@ impl UploadCache {
         let e = self.entries.get_mut(&key).unwrap();
         e.last_used = self.frame;
         let rect = e.image.rect;
-        // Only the requested tiles: the margin keeps the default fill until a later request
-        // reaches it (its tiles are recorded as default, so they're fetched then).
-        for c in TileGrid::coords_in(&want) {
+        // Every tile a caller may read (all of `need` the texture covers, content or not: an
+        // earlier request, or another grid's, may have left pixels there); the margin beyond
+        // keeps what it has until a request reaches it.
+        for c in TileGrid::coords_in(&align(need).intersect(&rect)) {
             let id = pyr.key(mip, c);
             if e.tiles.get(&c) == Some(&id) {
                 continue;
             }
-            let slot = match self.store.get(kernels, enc, class, grid, pyr, mip, c, default_value) {
+            let slot = match self.store.get(kernels, enc, doc, class, grid, pyr, mip, c, default_value) {
                 Some(s) => s,
                 None => self.store.constant(class, default_value),
             };

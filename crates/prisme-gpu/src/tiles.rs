@@ -7,11 +7,15 @@
 //! GPU copies ([`crate::upload`]), so panning, zooming and changing mip level never re-send
 //! pixels, and nothing is downsampled on the CPU. Least recently used tiles are evicted past
 //! a VRAM budget (a level-0 tile comes back from the CPU, a coarser one is rebuilt).
+//!
+//! Each tile records the documents that use it: releasing a closed document frees the tiles
+//! no other document uses, then [`TileStore::compact`] repacks the survivors into right-sized
+//! pages so the memory actually goes back (a page can't shrink around a few live layers).
 
 use crate::image::{GpuImage, PooledTex};
 use crate::kernels::{Globals, Kernels};
 use prisme_core::tile::{TileBuf, TileCoord, TileGrid, TILE_PIXELS, TILE_SIZE};
-use prisme_core::IRect;
+use prisme_core::{DocUid, IRect};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasher, Hash, Hasher};
@@ -193,6 +197,8 @@ pub struct Slot {
 struct Resident {
     slot: Slot,
     last_used: u64,
+    /// Documents that showed this tile (usually one).
+    owners: Vec<DocUid>,
 }
 
 /// Store key: class, level, content key, and (levels > 0) the default missing children read as.
@@ -235,8 +241,12 @@ impl TileStore {
     }
 
     fn new_page(&mut self, class: Class) {
-        let pages = self.pages.entry(class).or_default();
-        let layers = (FIRST_PAGE_LAYERS << pages.len().min(8)).min(self.max_layers).max(1);
+        let n = self.pages.get(&class).map_or(0, |p| p.len());
+        let layers = (FIRST_PAGE_LAYERS << n.min(8)).min(self.max_layers).max(1);
+        self.add_page(class, layers);
+    }
+
+    fn add_page(&mut self, class: Class, layers: u32) {
         let format = class.format();
         let tex = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("tile-page"),
@@ -261,7 +271,7 @@ impl TileStore {
             })
             .collect();
         self.bytes += layers as u64 * class.tile_bytes();
-        pages.push(Page { tex, slots, free: (0..layers).rev().collect() });
+        self.pages.entry(class).or_default().push(Page { tex, slots, free: (0..layers).rev().collect() });
     }
 
     /// Drop the least recently used quarter of the tiles not used this frame.
@@ -296,24 +306,119 @@ impl TileStore {
         }
     }
 
-    fn touch(&mut self, k: &Key) -> Option<Slot> {
+    fn touch(&mut self, k: &Key, doc: DocUid) -> Option<Slot> {
         let frame = self.frame;
         self.resident.get_mut(k).map(|r| {
             r.last_used = frame;
+            if !r.owners.contains(&doc) {
+                r.owners.push(doc);
+            }
             r.slot
         })
+    }
+
+    fn keep(&mut self, key: Key, slot: Slot, doc: DocUid) {
+        self.resident.insert(key, Resident { slot, last_used: self.frame, owners: vec![doc] });
+    }
+
+    /// Forget `doc`: tiles no other document uses are freed. Call [`TileStore::compact`] after
+    /// to give the memory back.
+    pub fn release(&mut self, doc: DocUid) {
+        let mut freed = vec![];
+        self.resident.retain(|k, r| {
+            r.owners.retain(|o| *o != doc);
+            let keep = !r.owners.is_empty();
+            if !keep {
+                freed.push((k.0, r.slot));
+            }
+            keep
+        });
+        for (class, s) in freed {
+            self.pages.get_mut(&class).unwrap()[s.page as usize].free.push(s.layer);
+        }
+    }
+
+    /// Drop tiles unused for `max_age` frames, then compact if less than half the page space
+    /// is live. Only between evaluations (see [`TileStore::compact`]).
+    pub fn trim(&mut self, max_age: u64) {
+        let frame = self.frame;
+        let mut freed = vec![];
+        self.resident.retain(|k, r| {
+            let keep = frame - r.last_used < max_age;
+            if !keep {
+                freed.push((k.0, r.slot));
+            }
+            keep
+        });
+        for (class, s) in freed {
+            self.pages.get_mut(&class).unwrap()[s.page as usize].free.push(s.layer);
+        }
+        let live: u64 = self.resident.keys().map(|k| k.0.tile_bytes()).sum::<u64>() + self.constants.keys().map(|k| k.0.tile_bytes()).sum::<u64>();
+        if live * 2 < self.bytes {
+            self.compact();
+        }
+    }
+
+    /// Repack each class's live tiles (and constants) into as few right-sized pages as hold
+    /// them, by GPU copy, dropping the old pages. Only between evaluations: no recorded
+    /// command may still name a slot.
+    pub fn compact(&mut self) {
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("tile-compact") });
+        for class in [Class::Mask, Class::Rgba16, Class::Rgba32] {
+            let Some(old) = self.pages.remove(&class) else { continue };
+            let capacity: usize = old.iter().map(|p| p.slots.len()).sum();
+            let live_keys: Vec<Key> = self.resident.keys().filter(|k| k.0 == class).copied().collect();
+            let live_consts: Vec<(Class, u32)> = self.constants.keys().filter(|k| k.0 == class).copied().collect();
+            let live = live_keys.len() + live_consts.len();
+            self.bytes -= capacity as u64 * class.tile_bytes();
+            if live == 0 {
+                continue;
+            }
+            // Pages for exactly the live tiles (the next allocation grows a new page as usual).
+            let mut left = live as u32;
+            while left > 0 {
+                let n = left.min(self.max_layers);
+                self.add_page(class, n);
+                left -= n;
+            }
+            let mut copy = |from: Slot, to: Slot| {
+                enc.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo { texture: &old[from.page as usize].tex, mip_level: 0, origin: wgpu::Origin3d { x: 0, y: 0, z: from.layer }, aspect: wgpu::TextureAspect::All },
+                    wgpu::TexelCopyTextureInfo { texture: &self.pages[&class][to.page as usize].tex, mip_level: 0, origin: wgpu::Origin3d { x: 0, y: 0, z: to.layer }, aspect: wgpu::TextureAspect::All },
+                    wgpu::Extent3d { width: TILE_SIZE, height: TILE_SIZE, depth_or_array_layers: 1 },
+                );
+            };
+            let mut next = (0..self.pages[&class].len()).flat_map(|p| (0..self.pages[&class][p].slots.len() as u32).map(move |l| Slot { page: p as u32, layer: l })).collect::<Vec<_>>().into_iter();
+            for k in live_keys {
+                let to = next.next().unwrap();
+                let r = self.resident.get_mut(&k).unwrap();
+                copy(r.slot, to);
+                r.slot = to;
+            }
+            for k in live_consts {
+                let to = next.next().unwrap();
+                let s = self.constants.get_mut(&k).unwrap();
+                copy(*s, to);
+                *s = to;
+            }
+            // Every layer of the new pages is taken.
+            for p in self.pages.get_mut(&class).unwrap() {
+                p.free.clear();
+            }
+        }
+        self.queue.submit([enc.finish()]);
     }
 
     /// The slot holding tile `c` of `grid` at level `mip` (keys from `pyr`, synced up to
     /// `mip`), uploading it or building it from its children as needed. None: no tile there.
     #[allow(clippy::too_many_arguments)]
-    pub fn get(&mut self, kernels: &mut Kernels, enc: &mut wgpu::CommandEncoder, class: Class, grid: &TileGrid, pyr: &Pyramid, mip: u32, c: TileCoord, default: f32) -> Option<Slot> {
+    pub fn get(&mut self, kernels: &mut Kernels, enc: &mut wgpu::CommandEncoder, doc: DocUid, class: Class, grid: &TileGrid, pyr: &Pyramid, mip: u32, c: TileCoord, default: f32) -> Option<Slot> {
         let id = pyr.key(mip, c);
         if id == 0 {
             return None;
         }
         let key: Key = (class, mip, id, if mip == 0 { 0 } else { default.to_bits() });
-        if let Some(s) = self.touch(&key) {
+        if let Some(s) = self.touch(&key, doc) {
             return Some(s);
         }
         if mip == 0 {
@@ -321,30 +426,30 @@ impl TileStore {
             let slot = self.alloc(class);
             self.write(class, slot, &class.bytes(t));
             self.uploads += 1;
-            self.resident.insert(key, Resident { slot, last_used: self.frame });
+            self.keep(key, slot, doc);
             return Some(slot);
         }
-        let kids = children(c).map(|k| self.get(kernels, enc, class, grid, pyr, mip - 1, k, default));
+        let kids = children(c).map(|k| self.get(kernels, enc, doc, class, grid, pyr, mip - 1, k, default));
         let slot = self.alloc(class);
         let inputs = kids.map(|k| k.map(|s| self.image(class, s).clone()));
         let channels = if class == Class::Mask { 1.0 } else { 4.0 };
         kernels.dispatch(enc, "k_downsample", self.image(class, slot), None, [inputs[0].as_ref(), inputs[1].as_ref(), inputs[2].as_ref(), inputs[3].as_ref()], &[channels, default], None, &G);
         self.builds += 1;
-        self.resident.insert(key, Resident { slot, last_used: self.frame });
+        self.keep(key, slot, doc);
         Some(slot)
     }
 
     /// Tile `c` at `mip` is resident (marks it used).
-    pub fn resident(&mut self, class: Class, pyr: &Pyramid, mip: u32, c: TileCoord, default: f32) -> bool {
+    pub fn resident(&mut self, doc: DocUid, class: Class, pyr: &Pyramid, mip: u32, c: TileCoord, default: f32) -> bool {
         let id = pyr.key(mip, c);
-        self.touch(&(class, mip, id, if mip == 0 { 0 } else { default.to_bits() })).is_some()
+        self.touch(&(class, mip, id, if mip == 0 { 0 } else { default.to_bits() }), doc).is_some()
     }
 
     /// Make the level-0 tile `id` resident from bits already on the GPU (`src`: buffer and
     /// offset, tile layout in this class's texel format).
-    pub fn adopt(&mut self, enc: &mut wgpu::CommandEncoder, class: Class, id: u64, src: (&wgpu::Buffer, u64)) {
+    pub fn adopt(&mut self, enc: &mut wgpu::CommandEncoder, doc: DocUid, class: Class, id: u64, src: (&wgpu::Buffer, u64)) {
         let key: Key = (class, 0, id, 0);
-        if self.touch(&key).is_some() {
+        if self.touch(&key, doc).is_some() {
             return;
         }
         let slot = self.alloc(class);
@@ -355,7 +460,7 @@ impl TileStore {
             wgpu::Extent3d { width: TILE_SIZE, height: TILE_SIZE, depth_or_array_layers: 1 },
         );
         self.adopted += 1;
-        self.resident.insert(key, Resident { slot, last_used: self.frame });
+        self.keep(key, slot, doc);
     }
 
     /// A tile filled with `value` (missing tiles of masks that reveal by default).

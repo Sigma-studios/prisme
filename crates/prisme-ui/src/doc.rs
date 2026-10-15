@@ -107,7 +107,9 @@ pub struct DocState {
 static NEXT_DOC_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl DocState {
-    pub fn new(doc: Document) -> Self {
+    pub fn new(mut doc: Document) -> Self {
+        // Each open document gets its own GPU caches, even one made by cloning another.
+        doc.uid = prisme_core::DocUid::fresh();
         let history = History::new(doc);
         let rev = history.revision();
         Self {
@@ -131,8 +133,9 @@ impl DocState {
         }
     }
 
-    pub fn from_history(history: History) -> Self {
+    pub fn from_history(mut history: History) -> Self {
         let mut s = Self::new(history.current().clone());
+        history.set_uid(s.history.current().uid);
         s.saved_revision = history.revision();
         s.history = history;
         s

@@ -107,9 +107,25 @@ impl<'de> Deserialize<'de> for DocumentInfo {
     }
 }
 
+/// Runtime identity of an open document, never saved. Layer, mask and node ids restart at 1
+/// in every document, so anything that caches per id across documents (the GPU engine) keys
+/// by this too, and releases a document's resources by it. Clones of a document (history
+/// snapshots, the working copy) share it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct DocUid(pub u64);
+
+impl DocUid {
+    pub fn fresh() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        DocUid(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
 /// A complete document state. Cheap to clone (heavy data is behind `Arc`s).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Document {
+    #[serde(skip, default = "DocUid::fresh")]
+    pub uid: DocUid,
     pub info: DocumentInfo,
     /// Layer tree, bottom to top.
     pub layers: Vec<Layer>,
@@ -123,6 +139,7 @@ pub struct Document {
 impl Document {
     pub fn new(name: impl Into<String>, width: u32, height: u32, format: PixelFormat) -> Self {
         Document {
+            uid: DocUid::fresh(),
             info: DocumentInfo { name: name.into(), width, height, format, dpi: 72.0, source_profile: None, canvas: CanvasKind::Fixed },
             layers: vec![],
             masks: vec![],

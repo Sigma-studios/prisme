@@ -38,6 +38,14 @@ impl History {
         &self.entries[self.cursor].doc
     }
 
+    /// Give every state the same runtime identity (a loaded history's states each deserialize
+    /// with their own).
+    pub fn set_uid(&mut self, uid: crate::DocUid) {
+        for e in &mut self.entries {
+            e.doc.uid = uid;
+        }
+    }
+
     pub fn revision(&self) -> u64 {
         self.revision
     }

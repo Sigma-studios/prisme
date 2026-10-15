@@ -14,11 +14,14 @@ use crate::upload::{UploadCache, UploadKey};
 use prisme_core::graph::{Node, ParamValue};
 use prisme_core::layer::{FillContent, Layer, LayerKind};
 use prisme_core::tile::TILE_SIZE;
-use prisme_core::{Document, Gradient, IRect, LayerId, NodeId, TileGrid};
+use prisme_core::{DocUid, Document, Gradient, IRect, LayerId, NodeId, TileGrid};
 use prisme_graph::{eval_curve, registry, SocketType, CURVE_CHANNELS, LEVEL_CHANNELS};
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::sync::Arc;
+
+/// Spare textures the pool always keeps (bytes).
+const BASE_POOL_FREE: u64 = 256 << 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum EvalFormat {
@@ -72,7 +75,9 @@ pub struct Engine {
     pub kernels: Kernels,
     pub(crate) pool: TexturePool,
     uploads: UploadCache,
-    rasters: HashMap<(LayerId, u32), (u64, Arc<TileGrid>)>,
+    /// Rasterized text/vector layers per (document, layer, level): content hash, grid, last
+    /// frame used.
+    rasters: HashMap<(DocUid, LayerId, u32), (u64, Arc<TileGrid>, u64)>,
     results: HashMap<u64, CachedResult>,
     luts: HashMap<u64, Arc<wgpu::Buffer>>,
     pub rasterizer: Option<Arc<dyn LayerRasterizer>>,
@@ -151,6 +156,17 @@ impl Engine {
         self.luts.clear();
     }
 
+    /// Free everything held for a closed document: its layer views, tile keys and rasterized
+    /// layers, the tiles no other document uses (their pages repacked so the memory goes
+    /// back), and cached results and spare textures sized for its views.
+    pub fn release_document(&mut self, doc: DocUid) {
+        self.uploads.release(doc);
+        self.rasters.retain(|k, _| k.0 != doc);
+        self.results.clear();
+        self.pool_keep = (0, self.frame);
+        self.pool.trim(BASE_POOL_FREE);
+    }
+
     /// Resident tiles: (uploaded from the CPU, built on the GPU, VRAM bytes) so far.
     pub fn tile_stats(&self) -> (u64, u64, u64) {
         let t = &self.uploads.store;
@@ -170,14 +186,14 @@ impl Engine {
                     continue;
                 }
                 if let LayerKind::Raster(g) = &l.kind
-                    && !self.uploads.prefetch(&mut self.kernels, &mut enc, UploadKey::Content(l.id.0), g, mip, rect, false, 0.0, out_of_time)
+                    && !self.uploads.prefetch(&mut self.kernels, &mut enc, doc.uid, UploadKey::Content(l.id.0), g, mip, rect, false, 0.0, out_of_time)
                 {
                     done = false;
                     break 'all;
                 }
                 if let Some(m) = l.mask.as_ref().filter(|m| m.enabled) {
                     let d = if m.default_visible { 1.0 } else { 0.0 };
-                    if !self.uploads.prefetch(&mut self.kernels, &mut enc, UploadKey::LayerMask(l.id.0), &m.grid, mip, rect, false, d, out_of_time) {
+                    if !self.uploads.prefetch(&mut self.kernels, &mut enc, doc.uid, UploadKey::LayerMask(l.id.0), &m.grid, mip, rect, false, d, out_of_time) {
                         done = false;
                         break 'all;
                     }
@@ -192,17 +208,23 @@ impl Engine {
     /// `p.coords[i]`'s tile (0: not kept). The store copies their bits from the GPU buffers they
     /// were read back from, so views don't upload them again. RGBA only (masks are stored as
     /// f32 on the GPU and upload as usual).
-    pub fn adopt_tiles(&mut self, p: &crate::pack::PackedTiles, ids: &[u64]) {
+    pub fn adopt_tiles(&mut self, doc: DocUid, p: &crate::pack::PackedTiles, ids: &[u64]) {
         if p.channels() != 4 {
             return;
         }
         let mut enc = self.ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("adopt") });
         for (i, &id) in ids.iter().enumerate() {
             if let (true, Some(src)) = (id != 0, p.bits(i)) {
-                self.uploads.store.adopt(&mut enc, crate::tiles::Class::Rgba16, id, src);
+                self.uploads.store.adopt(&mut enc, doc, crate::tiles::Class::Rgba16, id, src);
             }
         }
         self.ctx.queue.submit([enc.finish()]);
+    }
+
+    /// Drop resident tiles no view used for `max_age` evaluations and give the memory back
+    /// (also done periodically on its own).
+    pub fn trim_tiles(&mut self, max_age: u64) {
+        self.uploads.store.trim(max_age);
     }
 
     /// VRAM the resident tiles may hold (default 1 GiB).
@@ -327,7 +349,8 @@ impl Engine {
         if need >= self.pool_keep.0 || fr - self.pool_keep.1 > 300 {
             self.pool_keep = (need, fr);
         }
-        self.pool.trim((256u64 << 20).max(self.pool_keep.0));
+        self.pool.trim(BASE_POOL_FREE.max(self.pool_keep.0));
+        self.rasters.retain(|_, r| fr - r.2 < 600);
         Some(result)
     }
 
@@ -909,7 +932,7 @@ impl Engine {
 
     fn upload(&mut self, f: &mut Frame, key: UploadKey, grid: &TileGrid, rect: IRect, default: f32) -> Option<GpuImage> {
         let f32 = f.format == EvalFormat::F32;
-        let img = self.uploads.get(&self.ctx.device, &mut self.pool, &mut self.kernels, &mut f.enc, key, grid, f.mip, rect, f32, default);
+        let img = self.uploads.get(&self.ctx.device, &mut self.pool, &mut self.kernels, &mut f.enc, f.doc.uid, key, grid, f.mip, rect, f32, default);
         if let Some((base, p)) = f.stroke.and_then(|s| s.xform_args(key, 1 << f.mip)) {
             let mut out = self.new_image(f, rect);
             self.run(f, "k_xform", &out, [img.as_ref(), Some(&base), None, None], &p, None);
@@ -1012,13 +1035,16 @@ impl Engine {
             }
             LayerKind::Text(_) | LayerKind::Vector(_) => {
                 let hash = *f.layer_hashes.get(&layer.id)?;
-                let key = (layer.id, f.mip);
-                let grid = match self.rasters.get(&key) {
-                    Some((h, g)) if *h == hash => g.clone(),
+                let key = (f.doc.uid, layer.id, f.mip);
+                let grid = match self.rasters.get_mut(&key) {
+                    Some((h, g, used)) if *h == hash => {
+                        *used = self.frame;
+                        g.clone()
+                    }
                     _ => {
                         let r = self.rasterizer.as_ref()?.rasterize(layer, f.doc, f.mip)?;
                         let g = Arc::new(r);
-                        self.rasters.insert(key, (hash, g.clone()));
+                        self.rasters.insert(key, (hash, g.clone(), self.frame));
                         g
                     }
                 };
@@ -1029,6 +1055,7 @@ impl Engine {
                     &mut self.pool,
                     &mut self.kernels,
                     &mut f.enc,
+                    f.doc.uid,
                     UploadKey::Rasterized(layer.id.0, f.mip),
                     &grid,
                     0,

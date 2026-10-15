@@ -450,7 +450,7 @@ mod tests {
         assert!(landed.iter().all(|i| g.tiles.values().any(|t| t.id() == *i)), "ids are the document's tiles");
         // The store takes them over: the next render uploads nothing and matches a fresh engine.
         let before = e.tile_stats();
-        e.adopt_tiles(&p, &ids);
+        e.adopt_tiles(d.history.current().uid, &p, &ids);
         let px = render(&mut e, d.history.current());
         assert_eq!(e.tile_stats().0, before.0, "landed tiles were uploaded again");
         assert_eq!(px, render(&mut Engine::new(ctx), d.history.current()));

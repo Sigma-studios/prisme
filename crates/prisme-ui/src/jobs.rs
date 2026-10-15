@@ -391,8 +391,9 @@ pub fn poll(s: &mut AppState, ctx: &egui::Context) {
                     s.toast(format!("Opened {name}"));
                 }
                 Some(Err(e)) => {
-                    if let Some(p) = placeholder {
-                        s.docs.retain(|d| d.id != p);
+                    if let Some(i) = placeholder.and_then(|p| s.docs.iter().position(|d| d.id == p)) {
+                        let d = s.docs.remove(i);
+                        s.forget_doc(d);
                         s.active = s.active.min(s.docs.len().saturating_sub(1));
                     }
                     s.toast(format!("Couldn't open {name}: {e}"));
@@ -613,7 +614,8 @@ fn replace_or_add(s: &mut AppState, placeholder: Option<u64>, mut d: DocState, p
     }
     d.path = path;
     if let Some(i) = placeholder.and_then(|p| s.docs.iter().position(|x| x.id == p)) {
-        s.docs[i] = d;
+        let old = std::mem::replace(&mut s.docs[i], d);
+        s.forget_doc(old);
         crate::shortcuts::unfocus(s);
         s.active = i;
     } else {

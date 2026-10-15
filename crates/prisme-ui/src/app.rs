@@ -232,6 +232,31 @@ impl AppState {
         self.status = Some((msg.into(), prisme_platform::now_seconds()));
     }
 
+    /// Release everything held for a document that left `docs` (closed, or a loading
+    /// placeholder replaced or abandoned): its node editor, thumbnails, and the engine's GPU
+    /// memory for it. Every removal from `docs` goes through here.
+    pub fn forget_doc(&mut self, d: DocState) {
+        self.node_editors.remove(&d.id);
+        if let Some(g) = &mut self.gpu {
+            let ids: Vec<_> = g.thumbs.keys().filter(|k| k.0 == d.id).copied().collect();
+            let mut r = g.rs.renderer.write();
+            for k in ids {
+                if let Some((_, t, _)) = g.thumbs.remove(&k) {
+                    r.free_texture(&t);
+                }
+            }
+            drop(r);
+            g.engine.release_document(d.history.current().uid);
+        }
+        // Its pixels: a long history holds thousands of tile buffers, ~100 ms to free. Off
+        // the UI thread on native (plain data); the web has no thread to spare.
+        let crate::doc::DocState { history, working, .. } = d;
+        #[cfg(not(target_arch = "wasm32"))]
+        std::thread::Builder::new().name("free-document".into()).spawn(move || drop((history, working))).ok();
+        #[cfg(target_arch = "wasm32")]
+        drop((history, working));
+    }
+
     pub fn add_doc(&mut self, d: DocState) {
         crate::shortcuts::unfocus(self);
         self.startup_frames = None;

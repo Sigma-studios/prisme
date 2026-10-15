@@ -185,3 +185,94 @@ fn prefetch_stays_under_its_share_of_the_budget() {
     // One page past the threshold at most.
     assert!(bytes <= 64 << 20, "{bytes}");
 }
+
+fn render(e: &mut Engine, d: &Document, rect: IRect, mip: u32) -> Vec<f32> {
+    let img = e.evaluate(&EvalRequest { doc: d, rect, mip, format: EvalFormat::F16, source: RenderSource::LayerStack }).unwrap();
+    Readback::start(&e.ctx.device, &e.ctx.queue, &img, rect).wait(&e.ctx.device)
+}
+
+fn fresh(d: &Document, rect: IRect, mip: u32) -> Vec<f32> {
+    render(&mut engine().unwrap(), d, rect, mip)
+}
+
+/// Infinite doc (fill + one raster layer, ids 1 and 2 like every new document) with `r` painted.
+fn painted(r: IRect, c: [f32; 4]) -> Document {
+    let mut d = Document::infinite("t", 1000, 800, Some([1.0; 4]));
+    let id = d.active_layer.unwrap();
+    d.layer_mut(id).unwrap().raster_mut().unwrap().map_rect(&r, |_, _, p| p.copy_from_slice(&c));
+    d
+}
+
+#[test]
+fn documents_never_see_each_others_pixels() {
+    let Some(mut e) = engine() else { return };
+    let view = IRect::new(-1024, -768, 2048, 1536);
+    // A big painted document, shown at two levels...
+    let a = painted(IRect::new(-900, -700, 1900, 1400), [0.9, 0.1, 0.1, 1.0]);
+    render(&mut e, &a, view, 0);
+    render(&mut e, &a, IRect::new(-512, -384, 1024, 768), 1);
+    // ...then a new one with the same layer ids and a small stroke: only its own pixels.
+    let b = painted(IRect::new(200, 200, 600, 300), [0.1, 0.2, 0.9, 1.0]);
+    for (mip, r) in [(0, view), (1, IRect::new(-512, -384, 1024, 768))] {
+        assert!(render(&mut e, &b, r, mip) == fresh(&b, r, mip), "mip {mip}: the other document's pixels show");
+    }
+}
+
+#[test]
+fn erased_tiles_never_reappear() {
+    let Some(mut e) = engine() else { return };
+    let view = IRect::new(0, 0, 1536, 1024);
+    let mut d = painted(IRect::new(0, 0, 1500, 1000), [0.9, 0.1, 0.1, 1.0]);
+    render(&mut e, &d, view, 0);
+    // Erase everything but one corner tile: the content bounds shrink to it.
+    let id = d.active_layer.unwrap();
+    d.layer_mut(id).unwrap().raster_mut().unwrap().tiles.retain(|c, _| c.x == 0 && c.y == 0);
+    assert!(render(&mut e, &d, view, 0) == fresh(&d, view, 0));
+}
+
+#[test]
+fn releasing_a_document_gives_its_memory_back() {
+    let Some(mut e) = engine() else { return };
+    let view = IRect::new(-2048, -2048, 4096, 4096);
+    let a = painted(IRect::new(-2000, -2000, 4000, 4000), [0.9, 0.1, 0.1, 1.0]);
+    let b = painted(IRect::new(0, 0, 600, 300), [0.1, 0.2, 0.9, 1.0]);
+    // `b` shares one tile with a clone of `a` (pasted content keeps its tiles).
+    let mut b2 = a.clone();
+    b2.uid = prisme_core::DocUid::fresh();
+    for mip in [0, 1, 2] {
+        let k = 1 << mip;
+        render(&mut e, &a, IRect::new(view.x0 / k, view.y0 / k, view.x1 / k, view.y1 / k), mip);
+    }
+    render(&mut e, &b, IRect::new(0, 0, 1024, 512), 0);
+    render(&mut e, &b2, IRect::new(0, 0, 256, 256), 0);
+    let (_, _, full) = e.tile_stats();
+    let pool_full = e.pool_bytes();
+    e.release_document(a.uid);
+    let (up, _, after) = e.tile_stats();
+    assert!(after * 8 < full, "tile store kept {} of {} MiB", after >> 20, full >> 20);
+    assert!(e.pool_bytes() < pool_full, "pool kept its large textures");
+    // The other documents still render right without re-uploading (b2's tile was shared).
+    assert!(render(&mut e, &b, IRect::new(0, 0, 1024, 512), 0) == fresh(&b, IRect::new(0, 0, 1024, 512), 0));
+    assert!(render(&mut e, &b2, IRect::new(0, 0, 256, 256), 0) == fresh(&b2, IRect::new(0, 0, 256, 256), 0));
+    assert_eq!(e.tile_stats().0, up, "live documents' tiles were freed");
+}
+
+#[test]
+fn tiles_nothing_shows_any_more_are_trimmed() {
+    let Some(mut e) = engine() else { return };
+    let view = IRect::new(-2048, -2048, 4096, 4096);
+    let mut d = painted(IRect::new(-2000, -2000, 4000, 4000), [0.9, 0.1, 0.1, 1.0]);
+    render(&mut e, &d, view, 0);
+    let (_, _, full) = e.tile_stats();
+    // The big layer goes (deleted); the view only shows a small new one from now on.
+    let id = d.active_layer.unwrap();
+    *d.layer_mut(id).unwrap().raster_mut().unwrap() = TileGrid::rgba(PixelFormat::F16);
+    d.layer_mut(id).unwrap().raster_mut().unwrap().map_rect(&IRect::new(0, 0, 300, 300), |_, _, p| p.copy_from_slice(&[0.1, 0.2, 0.9, 1.0]));
+    let small = IRect::new(0, 0, 512, 512);
+    render(&mut e, &d, small, 0);
+    e.trim_tiles(1);
+    let (up, _, after) = e.tile_stats();
+    assert!(after * 8 < full, "kept {} of {} MiB", after >> 20, full >> 20);
+    assert!(render(&mut e, &d, small, 0) == fresh(&d, small, 0));
+    assert_eq!(e.tile_stats().0, up, "tiles in use were trimmed");
+}

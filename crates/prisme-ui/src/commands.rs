@@ -320,17 +320,8 @@ pub fn close_doc(s: &mut AppState, i: usize) {
     }
     s.dialogs.confirm_close = None;
     let d = s.docs.remove(i);
-    s.node_editors.remove(&d.id);
     prisme_platform::storage_delete(&format!("autosave/{}", d.id));
-    if let Some(g) = &mut s.gpu {
-        let ids: Vec<_> = g.thumbs.keys().filter(|k| k.0 == d.id).copied().collect();
-        let mut r = g.rs.renderer.write();
-        for k in ids {
-            if let Some((_, t, _)) = g.thumbs.remove(&k) {
-                r.free_texture(&t);
-            }
-        }
-    }
+    s.forget_doc(d);
     if s.active >= s.docs.len() {
         s.active = s.docs.len().saturating_sub(1);
     }
