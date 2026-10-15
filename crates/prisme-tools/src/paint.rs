@@ -42,6 +42,37 @@ pub fn fill_region(grid: &mut TileGrid, region: &TileGrid, color: [f32; 4], opac
     grid.remove_clear_tiles();
 }
 
+/// Swap the `seed`-coloured share of each pixel (weights in `share`) for `color`:
+/// an anti-aliased edge between the seed and a barrier colour becomes the same edge
+/// between `color` and the barrier. Works in gamma-encoded premultiplied values (as edges
+/// are usually anti-aliased) so transparent seeds fill behind line art. 4-channel grids only.
+pub fn unblend_fill(grid: &mut TileGrid, share: &TileGrid, seed: [f32; 4], color: [f32; 4], opacity: f32, sel: Option<&TileGrid>) {
+    if grid.channels != 4 {
+        return;
+    }
+    let pm = crate::region::premul;
+    let (s, f) = (pm(seed), pm(color));
+    let b = share.tile_bounds();
+    let sv = share.read_rect(&b);
+    let w = b.width() as usize;
+    grid.map_rect(&b, |x, y, p| {
+        let a = sv[(y - b.y0) as usize * w + (x - b.x0) as usize] * opacity * sel_at(sel, x, y);
+        if a <= 0.0 {
+            return;
+        }
+        let mut q = pm([p[0], p[1], p[2], p[3]]);
+        for k in 0..4 {
+            q[k] += a * (f[k] - s[k]);
+        }
+        let al = q[3].clamp(0.0, 1.0);
+        for k in 0..3 {
+            p[k] = if al > 1e-7 { prisme_color::srgb_to_linear((q[k] / al).max(0.0)) } else { 0.0 };
+        }
+        p[3] = al;
+    });
+    grid.remove_clear_tiles();
+}
+
 /// Render a gradient into `grid` over `bounds` (masked by the selection).
 pub fn draw_gradient(grid: &mut TileGrid, bounds: IRect, g: &Gradient, geo: &GradientGeometry, opacity: f32, sel: Option<&TileGrid>) {
     let lut = g.to_lut(1024);
@@ -213,6 +244,20 @@ impl RetouchCanvas {
 mod tests {
     use super::*;
     use prisme_core::PixelFormat;
+
+    #[test]
+    fn unblend_swaps_seed_share() {
+        let mut g = TileGrid::rgba(PixelFormat::F32);
+        let r = IRect::new(0, 0, 4, 4);
+        let v = prisme_color::srgb_to_linear(0.25);
+        g.map_rect(&r, |_, _, p| p.copy_from_slice(&[v, v, v, 1.0]));
+        let mut share = prisme_core::mask::new_mask_grid();
+        share.write_rect(&r, &[0.25; 16]);
+        // 25% white over black (sRGB), white → red: 25% red over black.
+        unblend_fill(&mut g, &share, [1.0; 4], [1.0, 0.0, 0.0, 1.0], 1.0, None);
+        let p = g.get_pixel(1, 1);
+        assert!((p[0] - v).abs() < 1e-5 && p[1].abs() < 1e-5 && (p[3] - 1.0).abs() < 1e-5, "{p:?}");
+    }
 
     #[test]
     fn clone_copies_source() {

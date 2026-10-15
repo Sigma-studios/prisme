@@ -1,7 +1,7 @@
 use super::*;
 use crate::input::{Phase, PointerKind};
-use crate::paint::{draw_gradient, fill_region, RetouchCanvas, RetouchMode};
-use crate::region::{flood, Sample};
+use crate::paint::{draw_gradient, fill_region, unblend_fill, RetouchCanvas, RetouchMode};
+use crate::region::{fill_flood, Sample};
 use crate::stroke::{target_grid, PaintTarget, StrokeOp, StrokeSpec};
 use prisme_brush::{BlendTarget, BrushSettings, Dab, InputSample, Stroke, StrokeCanvas, StrokeMode};
 use prisme_core::gradient::GradientGeometry;
@@ -410,7 +410,10 @@ impl Tool for FillTool {
         let snapshot = cx.doc.clone();
         let Some((grid, _, _)) = target_arc(&snapshot, target) else { return ToolOutcome::None };
         let sample = if cx.opts.sample_all_layers && !target.mask { Sample::Merged(&snapshot) } else { Sample::Layer(&grid) };
-        let region = flood(&sample, seed, cx.opts.tolerance, bounds, cx.opts.fill_antialias);
+        let region = fill_flood(&sample, seed, cx.opts.tolerance, bounds, cx.opts.fill_antialias && !target.mask);
+        // Sampling other layers, the edge pixels aren't this layer's: paint the fringe
+        // as plain coverage rather than un-blending.
+        let exact = matches!(sample, Sample::Layer(_));
         let color = if ev.mods.alt { cx.bg } else { cx.fg };
         let color = if target.mask {
             let v = prisme_color::linear_to_srgb(prisme_color::working_luminance([color[0], color[1], color[2]]));
@@ -420,7 +423,12 @@ impl Tool for FillTool {
         };
         let sel = snapshot.selection.clone();
         if let Some(g) = target_grid(cx.doc, target) {
-            fill_region(g, &region, color, cx.opts.fill_opacity, sel.as_deref());
+            fill_region(g, &region.core, color, cx.opts.fill_opacity, sel.as_deref());
+            if exact {
+                unblend_fill(g, &region.fringe, region.seed, color, cx.opts.fill_opacity, sel.as_deref());
+            } else {
+                fill_region(g, &region.fringe, color, cx.opts.fill_opacity, sel.as_deref());
+            }
         }
         ToolOutcome::Commit("Fill".into())
     }

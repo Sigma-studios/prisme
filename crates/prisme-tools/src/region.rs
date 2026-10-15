@@ -108,6 +108,10 @@ pub fn flood(sample: &Sample, seed: [i32; 2], tolerance: f32, bounds: IRect, ant
     if !bounds.contains(seed[0], seed[1]) {
         return new_mask_grid();
     }
+    to_grid(&flood_values(sample, seed, tolerance, bounds, antialias), bounds)
+}
+
+fn flood_values(sample: &Sample, seed: [i32; 2], tolerance: f32, bounds: IRect, antialias: bool) -> Vec<f32> {
     let c = sample.pixel(seed[0], seed[1]);
     let sim = similarity(sample, c, tolerance, bounds, antialias);
     let w = bounds.width() as usize;
@@ -144,7 +148,159 @@ pub fn flood(sample: &Sample, seed: [i32; 2], tolerance: f32, bounds: IRect, ant
             push(i + w);
         }
     }
-    to_grid(&out, bounds)
+    out
+}
+
+/// Paint-bucket region: the flood core plus its anti-aliased fringe.
+pub struct FillRegion {
+    /// Seed colour (straight alpha).
+    pub seed: [f32; 4],
+    /// Flood mask (as `flood`).
+    pub core: TileGrid,
+    /// Per-pixel share of the seed colour in the edge pixels just outside the core
+    /// (blends of seed and barrier colour the tolerance left out).
+    pub fringe: TileGrid,
+}
+
+/// Fringe rings explored outside the flood core.
+const FRINGE_RINGS: usize = 2;
+
+/// `flood`, plus an estimate of how much seed colour the barrier's anti-aliased edge
+/// pixels contain, so a fill can replace exactly that share instead of leaving a halo.
+pub fn fill_flood(sample: &Sample, seed: [i32; 2], tolerance: f32, bounds: IRect, antialias: bool) -> FillRegion {
+    let c = sample.pixel(seed[0], seed[1]);
+    if !bounds.contains(seed[0], seed[1]) {
+        return FillRegion { seed: c, core: new_mask_grid(), fringe: new_mask_grid() };
+    }
+    let mut out = flood_values(sample, seed, tolerance, bounds, antialias);
+    if !antialias {
+        return FillRegion { seed: c, core: to_grid(&out, bounds), fringe: new_mask_grid() };
+    }
+    let w = bounds.width() as usize;
+    let h = bounds.height() as usize;
+    let mut px = PixelCache::new(sample);
+    let s = premul(c);
+    // Seed share of pixel `i`: project it onto the seed→barrier segment, the barrier
+    // being the least seed-like colour nearby.
+    let mut share = |i: usize| -> f32 {
+        let (x, y) = ((i % w) as i32 + bounds.x0, (i / w) as i32 + bounds.y0);
+        let p = premul(px.get(x, y));
+        let mut b = s;
+        let mut bd = 0.0;
+        for dy in -2..=2 {
+            for dx in -2..=2 {
+                let q = premul(px.get(x + dx, y + dy));
+                let d = dist2(q, s);
+                if d > bd {
+                    bd = d;
+                    b = q;
+                }
+            }
+        }
+        if bd < 1e-6 {
+            return 0.0;
+        }
+        let a = (0..4).map(|k| (p[k] - b[k]) * (s[k] - b[k])).sum::<f32>() / bd;
+        let a = a.clamp(0.0, 1.0);
+        // Not a blend of the two (some third colour): leave it alone.
+        let resid: f32 = (0..4).map(|k| (p[k] - (b[k] + a * (s[k] - b[k]))).powi(2)).sum();
+        if resid > 0.25 * bd {
+            0.0
+        } else {
+            a
+        }
+    };
+    let mut fringe = vec![0.0f32; w * h];
+    let mut seen = vec![false; w * h];
+    // Soft flood edges are re-evaluated as fringe (the share is the better estimate);
+    // the outer ones don't propagate, the inner ones still seed the rings.
+    let mut ring: Vec<(usize, f32)> = Vec::new();
+    for i in 0..w * h {
+        if out[i] >= 0.5 {
+            seen[i] = true;
+            ring.push((i, 1.0));
+            if out[i] < 1.0 {
+                let a = share(i);
+                if a > 0.0 {
+                    fringe[i] = a;
+                    out[i] = 0.0;
+                }
+            }
+        } else {
+            out[i] = 0.0;
+        }
+    }
+    for _ in 0..FRINGE_RINGS {
+        let mut next = Vec::new();
+        for &(i, from) in &ring {
+            let (x, y) = (i % w, i / w);
+            let mut visit = |j: usize| {
+                if seen[j] {
+                    return;
+                }
+                let a = share(j);
+                // Shares must fall moving outward, or we'd leak past a thin line.
+                if a > 0.02 && a < from {
+                    seen[j] = true;
+                    fringe[j] = a;
+                    next.push((j, a));
+                }
+            };
+            if x > 0 {
+                visit(i - 1);
+            }
+            if x + 1 < w {
+                visit(i + 1);
+            }
+            if y > 0 {
+                visit(i - w);
+            }
+            if y + 1 < h {
+                visit(i + w);
+            }
+        }
+        ring = next;
+    }
+    FillRegion { seed: c, core: to_grid(&out, bounds), fringe: to_grid(&fringe, bounds) }
+}
+
+/// Gamma-encoded, premultiplied: anti-aliasing is usually blended in encoded values.
+pub(crate) fn premul(p: [f32; 4]) -> [f32; 4] {
+    let a = p[3].clamp(0.0, 1.0);
+    let e = prisme_color::linear_to_srgb;
+    [e(p[0]) * a, e(p[1]) * a, e(p[2]) * a, a]
+}
+
+fn dist2(a: [f32; 4], b: [f32; 4]) -> f32 {
+    (0..4).map(|k| (a[k] - b[k]).powi(2)).sum()
+}
+
+/// Per-pixel reads, flattening each merged tile once.
+struct PixelCache<'a> {
+    sample: &'a Sample<'a>,
+    tiles: std::collections::HashMap<TileCoord, Option<Vec<f32>>>,
+}
+
+impl<'a> PixelCache<'a> {
+    fn new(sample: &'a Sample<'a>) -> Self {
+        Self { sample, tiles: Default::default() }
+    }
+
+    fn get(&mut self, x: i32, y: i32) -> [f32; 4] {
+        if let Sample::Layer(g) = self.sample {
+            return g.get_pixel(x, y);
+        }
+        let c = TileCoord::of_pixel(x, y);
+        let sample = self.sample;
+        let t = self.tiles.entry(c).or_insert_with(|| sample.tile(c));
+        match t {
+            Some(d) => {
+                let i = (((y - c.y * TS) * TS + (x - c.x * TS)) * 4) as usize;
+                [d[i], d[i + 1], d[i + 2], d[i + 3]]
+            }
+            None => [0.0; 4],
+        }
+    }
 }
 
 #[cfg(test)]
@@ -168,6 +324,39 @@ mod tests {
         assert_eq!(m.get_pixel(50, 150)[0], 1.0);
         assert_eq!(m.get_pixel(150, 150)[0], 0.0);
         assert_eq!(m.get_pixel(250, 150)[0], 0.0);
+    }
+
+    /// White, an anti-aliased black line at x = 100..103 (sRGB grey ramps either side), white.
+    fn aa_line() -> TileGrid {
+        let mut g = TileGrid::rgba(PixelFormat::F32);
+        g.map_rect(&IRect::new(0, 0, 200, 50), |x, _, p| {
+            let v = match x {
+                99 => 0.75,
+                100 => 0.3,
+                101 => 0.0,
+                102 => 0.3,
+                103 => 0.75,
+                _ => 1.0,
+            };
+            let v = prisme_color::srgb_to_linear(v);
+            p.copy_from_slice(&[v, v, v, 1.0]);
+        });
+        g
+    }
+
+    #[test]
+    fn fill_fringe_covers_aa_edge_without_leaking() {
+        let g = aa_line();
+        let r = fill_flood(&Sample::Layer(&g), [10, 10], 0.12, IRect::new(0, 0, 200, 50), true);
+        assert_eq!(r.core.get_pixel(98, 10)[0], 1.0);
+        // The grey ramp is outside tolerance but carries its seed share.
+        assert!((r.fringe.get_pixel(99, 10)[0] - 0.75).abs() < 0.05);
+        assert!((r.fringe.get_pixel(100, 10)[0] - 0.3).abs() < 0.05);
+        assert_eq!(r.fringe.get_pixel(101, 10)[0], 0.0);
+        // Nothing past the line.
+        for x in 102..200 {
+            assert_eq!(r.core.get_pixel(x, 10)[0] + r.fringe.get_pixel(x, 10)[0], 0.0, "x {x}");
+        }
     }
 
     #[test]
