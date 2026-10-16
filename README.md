@@ -6,7 +6,7 @@ Runs on Windows, macOS, Linux and the web (WebGPU).
 ## Run
 
 ```sh
-cargo run --release -p prisme-desktop -- [image files…]   # desktop
+cargo run --release -p prisme-desktop -- [image files…]   # desktop (--list-formats prints openable extensions)
 cd apps/prisme-web && trunk serve --release               # web (needs a WebGPU browser)
 cargo test --workspace --release                          # tests (GPU tests use any available adapter)
 ```

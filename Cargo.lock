@@ -3473,6 +3473,7 @@ dependencies = [
  "eframe",
  "env_logger",
  "log",
+ "prisme-io",
  "prisme-ui",
 ]
 

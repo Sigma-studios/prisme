@@ -2,6 +2,13 @@
 
 fn main() -> eframe::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn,prisme=info")).init();
+    // `--list-formats`: openable extensions, one per line (used by shell completion).
+    if std::env::args().nth(1).as_deref() == Some("--list-formats") {
+        for e in prisme_io::supported_extensions() {
+            println!("{e}");
+        }
+        return Ok(());
+    }
     let start = std::time::Instant::now();
     // Files passed on the command line (also used by "Open with…").
     let files: Vec<std::path::PathBuf> = std::env::args().skip(1).map(Into::into).collect();
