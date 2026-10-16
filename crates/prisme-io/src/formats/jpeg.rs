@@ -89,6 +89,8 @@ fn ycck_to_ink(data: &[u8]) -> Vec<u8> {
 }
 
 /// Preview via `jpeg-decoder`'s DCT-domain scaling (1/2, 1/4, 1/8), then box filtering.
+/// None when no scaling applies (longest side under 2 × `max_side`): the preview would then
+/// be a full decode, costing as much as the real one (measured 1.0–1.5×).
 fn preview_jpeg(bytes: &[u8], max_side: u32) -> Option<DecodedImage> {
     let mut dec = jpeg_decoder::Decoder::new(bytes);
     dec.read_info().ok()?;
@@ -99,6 +101,9 @@ fn preview_jpeg(bytes: &[u8], max_side: u32) -> Option<DecodedImage> {
     let rw = ((w as f64 * s).ceil() as u32).clamp(1, u16::MAX as u32) as u16;
     let rh = ((h as f64 * s).ceil() as u32).clamp(1, u16::MAX as u32) as u16;
     let (sw, sh) = dec.scale(rw, rh).ok()?;
+    if (sw as u32, sh as u32) == (w, h) {
+        return None;
+    }
     let data = dec.decode().ok()?;
     let layout = match dec.info()?.pixel_format {
         jpeg_decoder::PixelFormat::L8 => Layout::Gray,

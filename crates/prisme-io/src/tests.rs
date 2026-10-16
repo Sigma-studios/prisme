@@ -152,6 +152,13 @@ fn jpeg_exif_orientation_rotates_pixels() {
     assert_close(px(&prev, prev.width / 2, 1), red, 0.05);
 }
 
+#[test]
+fn jpeg_preview_skipped_when_it_would_be_a_full_decode() {
+    // 64 px wide: halving gives 32 < 40, so only a full-size decode could serve the preview.
+    assert!(decode_preview(&jpeg_with_orientation(1), "a.jpg", 40).is_none());
+    assert!(decode_preview(&jpeg_with_orientation(1), "a.jpg", 32).is_some());
+}
+
 fn tiff_page_rgb8(enc: &mut tiff::encoder::TiffEncoder<&mut Cursor<Vec<u8>>>, w: u32, h: u32, v: u8) {
     let data = vec![v; (w * h * 3) as usize];
     enc.write_image::<tiff::encoder::colortype::RGB8>(w, h, &data).unwrap();
