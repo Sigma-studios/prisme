@@ -17,7 +17,9 @@ fn main() -> eframe::Result<()> {
             .with_title("Prisme")
             .with_inner_size([1480.0, 920.0])
             .with_min_inner_size([800.0, 500.0])
-            .with_drag_and_drop(true),
+            .with_drag_and_drop(true)
+            // Window/Dock icon (eframe would otherwise show its own, even inside the .app bundle).
+            .with_icon(eframe::icon_data::from_png_bytes(include_bytes!("../icon-512.png")).expect("valid icon")),
         renderer: eframe::Renderer::Wgpu,
         wgpu_options: prisme_ui::wgpu_options(),
         persist_window: true,
