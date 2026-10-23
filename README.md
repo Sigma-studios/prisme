@@ -60,7 +60,9 @@ It returns a `Task` (a `Pending` result plus a `JobControl` for progress/cancell
 (`public_url = "./"`, `filehash = false` so `worker.js` can import `./prisme-web.js` / `./prisme-web_bg.wasm`):
 `index.html`, `prisme-web.js`, `prisme-web_bg.wasm`, `worker.js` (plus `snippets/`). Zip the contents of `dist/` and
 upload it as an HTML game on itch.io (or any static host, any subpath); no special headers are needed. It needs a
-WebGPU browser with module-worker support (all current WebGPU browsers have it).
+WebGPU browser with module-worker support (all current WebGPU browsers have it). [facade](https://github.com/Sigma-studios/facade)
+deploys it straight from the repository: its scan finds the trunk app in `apps/prisme-web`, builds it on the node and
+serves the output (`facade app create prisme --git https://github.com/Sigma-studios/prisme --domain …`).
 
 ### Automation
 `PRISME_SCRIPT="open:img.jpg;node:levels;param:m.gamma=1.3;export:out.png;quit"` drives the desktop app for
