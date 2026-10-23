@@ -132,6 +132,10 @@ mod imp {
     pub fn get_text() -> Pending<Option<String>> {
         spawn(|| with(|c| c.get_text()).ok())
     }
+
+    pub fn get_files() -> Pending<Vec<std::path::PathBuf>> {
+        spawn(|| with(|c| c.get().file_list()).unwrap_or_default())
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -267,4 +271,18 @@ pub fn clipboard_set_text(s: String) {
 /// Read text from the clipboard.
 pub fn clipboard_get_text() -> Pending<Option<String>> {
     imp::get_text()
+}
+
+/// Files copied in a file manager (Finder, Explorer, Files…); empty when there are none.
+/// Native only: on the web, pasted files come with the browser's paste event instead (eframe
+/// delivers them as dropped files), so this is always empty.
+pub fn clipboard_get_files() -> Pending<Vec<std::path::PathBuf>> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        imp::get_files()
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        Pending::ready(Vec::new())
+    }
 }

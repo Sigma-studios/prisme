@@ -47,3 +47,12 @@ those shortcuts (Paste image, Copy Merged = Cmd+Shift+C, Paste as New Image = Cm
   presses as `Event::Key` (tracking modifiers from `ModifiersChanged`); `clipboard_key` picks
   the key like egui-winit (logical, physical fallback for non-Latin layouts). Text fields keep
   using the clipboard events. The web runner already forwards the key.
+
+## eframe 0.36.2 — pasted files (web)
+
+The web runner reads only text from the browser's `paste` event, and the async clipboard API
+can't see files copied in a file manager (Finder, Files…).
+
+- `web/events.rs`: a `paste` event carrying files (copied files, or image data, which browsers
+  expose as a file) pushes them to `raw.dropped_files`, like a drop. Prisme places them as
+  layers (Cmd+Alt+V or Shift: separately) and leaves Cmd+V's clipboard-API Paste to the menu.

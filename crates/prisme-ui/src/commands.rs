@@ -89,6 +89,12 @@ pub fn handle_shortcuts(s: &mut AppState, ctx: &egui::Context) {
         }
     }
     for a in s.settings.keymap.triggered(ctx) {
+        // On the web, Cmd+V is answered by the browser's paste event, which carries files copied
+        // in a file manager and image data alike (they arrive as dropped files); the clipboard
+        // API Paste uses can't see copied files. The Edit menu's Paste still uses it.
+        if cfg!(target_arch = "wasm32") && matches!(a, Action::Paste | Action::PasteNewDoc) {
+            continue;
+        }
         run_action(s, a, ctx);
     }
     if ctx.input(|i| i.key_pressed(egui::Key::Escape))
@@ -674,7 +680,8 @@ pub fn set_clipboard(s: &mut AppState, grid: TileGrid, bounds: IRect) {
 }
 
 fn paste(s: &mut AppState, new_doc: bool) {
-    s.jobs.push(crate::jobs::Job::ClipboardGet { pending: prisme_platform::clipboard_get_image(), new_doc });
+    // Files copied in a file manager first (they open like dropped files), else image data.
+    s.jobs.push(crate::jobs::Job::ClipboardFiles { pending: prisme_platform::clipboard_get_files(), new_doc });
 }
 
 /// Paste pixels as a new layer (centered on the view when they came from outside). With no

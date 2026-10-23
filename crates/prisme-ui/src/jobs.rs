@@ -18,6 +18,7 @@ pub enum Job {
     Save { pending: Pending<Result<Option<String>, String>>, doc: u64, revision: u64 },
     ClipboardSet(Pending<Result<(), String>>),
     ClipboardGet { pending: Pending<Option<prisme_platform::ClipboardImage>>, new_doc: bool },
+    ClipboardFiles { pending: Pending<Vec<std::path::PathBuf>>, new_doc: bool },
     ScreenPick { pending: Pending<Option<[u8; 3]>>, to_bg: bool },
     FontFiles(Pending<Vec<PickedFile>>),
     LutFile { pending: Pending<Vec<PickedFile>>, doc: u64, node: NodeId, key: String },
@@ -448,6 +449,22 @@ pub fn poll(s: &mut AppState, ctx: &egui::Context) {
                 }
                 None if pending.is_abandoned() => {}
                 None => keep.push(Job::ClipboardGet { pending, new_doc }),
+            },
+            Job::ClipboardFiles { mut pending, new_doc } => match pending.poll() {
+                Some(paths) => {
+                    let openable = |p: &std::path::Path| {
+                        p.extension().and_then(|e| e.to_str()).is_some_and(|e| prisme_io::supported_extensions().contains(&e.to_ascii_lowercase().as_str()))
+                    };
+                    let images: Vec<_> = paths.into_iter().filter(|p| openable(p)).collect();
+                    if images.is_empty() {
+                        keep.push(Job::ClipboardGet { pending: prisme_platform::clipboard_get_image(), new_doc });
+                    }
+                    for path in images {
+                        crate::app::open_dropped_path(s, path, new_doc);
+                    }
+                }
+                None if pending.is_abandoned() => {}
+                None => keep.push(Job::ClipboardFiles { pending, new_doc }),
             },
             Job::ScreenPick { mut pending, to_bg } => match pending.poll() {
                 Some(Some(c)) => {

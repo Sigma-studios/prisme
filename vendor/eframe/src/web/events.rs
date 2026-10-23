@@ -341,6 +341,25 @@ fn install_copy_cut_paste(runner_ref: &WebRunner, target: &EventTarget) -> Resul
             return; // The eframe app is not interested
         }
 
+        // PRISME PATCH: pasted files (copied in a file manager, or image data, which browsers
+        // expose as a file) arrive like dropped files; the clipboard API can't see copied files.
+        if let Some(files) = event.clipboard_data().and_then(|data| data.files())
+            && files.length() > 0
+        {
+            for i in 0..files.length() {
+                if let Some(file) = files.get(i) {
+                    log::debug!("Pasted {:?} ({} bytes)", file.name(), file.size());
+                    runner.input.raw.dropped_files.push(std::sync::Arc::new(
+                        super::dropped_file::WebFile::from(file),
+                    ));
+                }
+            }
+            runner.needs_repaint.repaint_asap();
+            event.stop_propagation();
+            event.prevent_default();
+            return;
+        }
+
         if let Some(data) = event.clipboard_data()
             && let Ok(text) = data.get_data("text")
         {

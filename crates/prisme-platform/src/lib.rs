@@ -56,7 +56,7 @@ mod web;
 mod windows;
 
 pub use clipboard::{
-    ClipboardImage, clipboard_get_image, clipboard_get_text, clipboard_set_image,
+    ClipboardImage, clipboard_get_files, clipboard_get_image, clipboard_get_text, clipboard_set_image,
     clipboard_set_text, decode_png, encode_png,
 };
 pub use files::{

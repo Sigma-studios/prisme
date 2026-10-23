@@ -584,11 +584,9 @@ fn handle_dropped_files(s: &mut AppState, ctx: &egui::Context) {
     for f in files {
         let path = f.path().to_path_buf();
         let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "dropped".into());
-        // Dropping onto an open document places it as a layer (hold Shift to open separately).
-        // The untouched launch document isn't a target: the file replaces it.
-        let blank = s.doc().is_some_and(|d| d.blank_startup && !d.is_dirty());
-        let place = !s.docs.is_empty() && !blank && !ctx.input(|i| i.modifiers.shift) && !prisme_io::is_project_file(&name);
-        let into = if place { s.doc().map(|d| d.id) } else { None };
+        // Files pasted on the web come this way too: Cmd+Alt+V opens them separately.
+        let separately = ctx.input(|i| i.modifiers.shift || i.modifiers.alt);
+        let into = drop_target(s, &name, separately);
         let p = (!path.as_os_str().is_empty()).then_some(path);
         #[cfg(not(target_arch = "wasm32"))]
         if let Ok(bytes) = f.bytes() {
@@ -601,6 +599,27 @@ fn handle_dropped_files(s: &mut AppState, ctx: &egui::Context) {
             s.jobs.push(crate::jobs::Job::Dropped { pending, name, into });
             let _ = p;
         }
+    }
+}
+
+/// Where a dropped or pasted file goes: placed as a layer in the open document, unless opened
+/// `separately` (Shift), it is a project, or the document is the untouched launch one (which
+/// the file replaces).
+fn drop_target(s: &AppState, name: &str, separately: bool) -> Option<u64> {
+    let blank = s.doc().is_some_and(|d| d.blank_startup && !d.is_dirty());
+    let place = !s.docs.is_empty() && !blank && !separately && !prisme_io::is_project_file(name);
+    if place { s.doc().map(|d| d.id) } else { None }
+}
+
+/// Opens a file from disk the way a drop does (files copied in a file manager and pasted).
+pub fn open_dropped_path(s: &mut AppState, path: std::path::PathBuf, separately: bool) {
+    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "pasted".into());
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            let into = drop_target(s, &name, separately);
+            crate::jobs::decode_file(s, name, bytes, into, Some(path));
+        }
+        Err(e) => s.toast(format!("Can't read {name}: {e}")),
     }
 }
 
