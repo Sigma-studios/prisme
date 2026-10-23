@@ -163,11 +163,13 @@ mod help {
 
     const SUPPORT: &str = "https://github.com/gpuweb/gpuweb/wiki/Implementation-Status";
 
-    /// An internal page (`chrome://…`, `about:config`): pages can't link to those, so it is
-    /// shown with a button copying it, to paste in the address bar.
+    /// An internal page (`chrome://…`, `about:config`): browsers refuse to open those from a
+    /// page, even in a new tab ("Not allowed to load local resource"), so the address itself
+    /// is a button copying it, to paste in the address bar.
     fn internal(url: &str) -> String {
         format!(
-            "<code>{url}</code> <button type=\"button\" onclick=\"navigator.clipboard.writeText('{url}');this.textContent='Copied'\">Copy</button>"
+            "<button type=\"button\" class=\"addr\" title=\"Copy, then paste in the address bar\" \
+             onclick=\"navigator.clipboard.writeText('{url}').then(() => this.dataset.copied = 1)\">{url}</button>"
         )
     }
 
@@ -196,10 +198,18 @@ mod help {
                         .into(),
                 );
                 steps.push(format!(
-                    "{} should then list WebGPU as <b>Hardware accelerated</b>. It needs working Vulkan drivers; \
-                     on NixOS, a browser bundling its own Vulkan loader can't find them.",
+                    "Check {}: besides WebGPU, <b>Vulkan</b> must work, since WebGPU runs on it on Linux. If it \
+                     reads Disabled, or the <b>Dawn Info</b> section at the bottom lists no Vulkan adapter, the \
+                     browser can't reach a Vulkan driver (<code>vulkaninfo --summary</code> shows whether the system \
+                     has one).",
                     internal(&format!("{scheme}://gpu")),
                 ));
+                steps.push(
+                    "On NixOS, browsers bundling their own Vulkan loader (Vivaldi) can't find the drivers: start it \
+                     with <code>VK_DRIVER_FILES</code> listing the files in \
+                     <code>/run/opengl-driver/share/vulkan/icd.d</code>, or use nixpkgs' Chromium or Google Chrome."
+                        .into(),
+                );
             }
             (Engine::Chromium { scheme, name }, _) => {
                 if *problem == Problem::NoWebGpu {
@@ -235,8 +245,8 @@ mod help {
         let steps: String = steps.iter().map(|s| format!("<li>{s}</li>")).collect();
         format!(
             "<h1>◆ Prisme</h1><p>{what}</p><ol>{steps}</ol>\
-             <p class=\"small\">Internal pages like these can't be opened from a link: paste them in the \
-             address bar. <a href=\"{SUPPORT}\" target=\"_blank\" rel=\"noopener\">Which browsers support WebGPU</a></p>"
+             <p class=\"small\">Browsers don't let pages open their internal pages, so click an address to \
+             copy it, then paste it in the address bar. <a href=\"{SUPPORT}\" target=\"_blank\" rel=\"noopener\">Which browsers support WebGPU</a></p>"
         )
     }
 
@@ -268,9 +278,10 @@ mod help {
         fn chromium_on_linux_gets_the_flags() {
             let html = html(&Problem::NoAdapter, &Browser::detect(VIVALDI_LINUX, false));
             assert!(html.contains("gave Prisme no GPU"));
-            assert!(html.contains("<code>chrome://flags/#enable-unsafe-webgpu</code>"));
+            assert!(html.contains(">chrome://flags/#enable-unsafe-webgpu</button>"));
+            assert!(html.contains("writeText('chrome://flags/#enable-unsafe-webgpu')"));
             assert!(html.contains("chrome://flags/#enable-vulkan"));
-            assert!(html.contains("NixOS"));
+            assert!(html.contains("NixOS") && html.contains("VK_DRIVER_FILES") && html.contains("Dawn Info"));
             assert!(html.contains(SUPPORT));
         }
 

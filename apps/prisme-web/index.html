@@ -17,8 +17,9 @@
     #loading.help h1 { text-align: center; }
     #loading.help li { margin: 0.5em 0; }
     #loading.help code { background: #26282e; padding: 0.1em 0.35em; border-radius: 4px; white-space: nowrap; }
-    #loading.help button { font: inherit; font-size: 0.85em; color: #dee0e6; background: #33363e; border: 1px solid #4a4e58; border-radius: 4px; padding: 0.05em 0.6em; cursor: pointer; }
-    #loading.help button:hover { background: #3d414b; }
+    #loading.help button.addr { font-family: ui-monospace, Menlo, monospace; font-size: 0.85em; color: #dee0e6; background: #26282e; border: 1px solid #4a4e58; border-radius: 4px; padding: 0.05em 0.4em; cursor: copy; white-space: nowrap; }
+    #loading.help button.addr:hover { border-color: #6e8cff; }
+    #loading.help button.addr[data-copied]::after { content: " ✓ copied"; color: #7fd18b; font-family: system-ui, sans-serif; }
     #loading.help a { color: #6e8cff; }
     #loading.help .small { font-size: 0.85em; color: #9a9ea8; }
   </style>
