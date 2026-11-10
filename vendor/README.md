@@ -56,3 +56,12 @@ can't see files copied in a file manager (Finder, Files…).
 - `web/events.rs`: a `paste` event carrying files (copied files, or image data, which browsers
   expose as a file) pushes them to `raw.dropped_files`, like a drop. Prisme places them as
   layers (Cmd+Alt+V or Shift: separately) and leaves Cmd+V's clipboard-API Paste to the menu.
+
+## eframe 0.36.2 — saved window state follows `persist_window`
+
+eframe saves the window's size, position and fullscreen state only with
+`NativeOptions::persist_window`, but restores whatever was saved regardless: a window once
+fullscreen kept opening fullscreen after Prisme turned saving off to open maximized.
+
+- `native/wgpu_integration.rs`, `native/glow_integration.rs`: `load_window_settings` only
+  with `persist_window`.

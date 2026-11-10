@@ -197,7 +197,11 @@ impl<'app> GlowWinitApp<'app> {
         native_options: &mut NativeOptions,
     ) -> Result<(GlutinWindowContext, egui_glow::Painter)> {
         profiling::function_scope!();
-        let window_settings = epi_integration::load_window_settings(storage);
+        // PRISME PATCH: the saved window comes back only with `persist_window`, as it's saved.
+        let window_settings = native_options
+            .persist_window
+            .then(|| epi_integration::load_window_settings(storage))
+            .flatten();
 
         let winit_window_builder = epi_integration::viewport_builder(
             egui_ctx.zoom_factor(),
